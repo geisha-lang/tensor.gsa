@@ -1,11 +1,8 @@
-// Minimal native shim for tensor.gsa:
-// 1. Vendor BLAS SGEMM / Batched SGEMM (Apple Accelerate AMX / OpenBLAS / C fallback)
-// 2. Thin binary file I/O helpers for pure-Geisha Safetensors
-// 3. Optional CUDA backend bridge (when compiled with `nvcc` / `-DGS_TENSOR_CUDA`)
+// Minimal BLAS shim for tensor.gsa (~80 lines):
+// Vendor BLAS SGEMM / Batched SGEMM (Apple Accelerate AMX / OpenBLAS / C fallback)
+// + optional CUDA device count probe (when compiled with `nvcc`).
 
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #if defined(__APPLE__) && !defined(GS_TENSOR_NO_ACCELERATE)
@@ -19,10 +16,6 @@
 #ifdef GS_TENSOR_CUDA
 #include "backend.h"
 #endif
-
-// ============================================================================
-// CPU BLAS SGEMM & Batched SGEMM
-// ============================================================================
 
 void gs_t_sgemm_cpu(
     int32_t transA, int32_t transB,
@@ -101,30 +94,3 @@ int32_t gs_t_cuda_device_count(void) {
     return 0;
 #endif
 }
-
-// ============================================================================
-// Binary File I/O Helpers for Pure-Geisha Safetensors
-// ============================================================================
-
-void *gs_t_fopen_wb(const char *path) { return (void *)fopen(path, "wb"); }
-void *gs_t_fopen_rb(const char *path) { return (void *)fopen(path, "rb"); }
-int32_t gs_t_fclose(void *fp) { return fp ? fclose((FILE *)fp) : -1; }
-
-int64_t gs_t_fwrite_u64_le(void *fp, int64_t v) {
-    uint8_t buf[8];
-    uint64_t u = (uint64_t)v;
-    for (int i = 0; i < 8; i++) buf[i] = (uint8_t)((u >> (8 * i)) & 0xffU);
-    return (int64_t)fwrite(buf, 1, 8, (FILE *)fp);
-}
-
-int64_t gs_t_fread_u64_le(void *fp) {
-    uint8_t buf[8];
-    if (fread(buf, 1, 8, (FILE *)fp) != 8) return -1;
-    uint64_t u = 0;
-    for (int i = 0; i < 8; i++) u |= ((uint64_t)buf[i]) << (8 * i);
-    return (int64_t)u;
-}
-
-int64_t gs_t_fwrite_bytes(void *fp, const void *ptr, int64_t n) { return n > 0 ? (int64_t)fwrite(ptr, 1, (size_t)n, (FILE *)fp) : 0; }
-int64_t gs_t_fread_bytes(void *fp, void *ptr, int64_t n) { return n > 0 ? (int64_t)fread(ptr, 1, (size_t)n, (FILE *)fp) : 0; }
-int64_t gs_t_fwrite_cstr(void *fp, const char *s, int64_t n) { return n > 0 ? (int64_t)fwrite(s, 1, (size_t)n, (FILE *)fp) : 0; }

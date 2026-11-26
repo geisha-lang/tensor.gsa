@@ -6,7 +6,7 @@ Functional, zero-boilerplate Deep Learning framework for **Geisha**.
 - **Local-Tape Reverse-Mode AD**: `valueAndGrad(model, lossFn)` with `customVjp` hook for fused kernels.
 - **Pure-Geisha CPU Kernels + Minimal Native Shim**:
   - **CPU (`src/cpu.gsa`)**: All elementwise, N-D broadcasting, reductions, norms, activations, RoPE, PRNG, and fused AdamW kernels are written in **100% pure Geisha** (`Float32` + `ScopedPtr` safepoint-free leaf loops).
-  - **Native (`native/blas.c`, ~120 lines)**: Thin vendor BLAS SGEMM/BGEMM shim (Apple Accelerate / OpenBLAS / C fallback) + binary file I/O.
+  - **Native (`native/blas.c`, ~95 lines)**: Pure vendor BLAS SGEMM/BGEMM shim (Apple Accelerate / OpenBLAS / C fallback) — zero custom C file I/O (Safetensors uses `sys.fs.withMmap` + libc `fwrite`).
   - **CUDA (`native/cuda.cu`)**: Optional GPU backend (`cublasSgemm` / `cublasSgemmStridedBatched` + single-launch multi-tensor fused AdamW + CUDA kernels, auto-detected when `nvcc` is on `PATH`).
 - **Optimizers**: Pure functional `AdamW` and `Muon` (5-step Newton-Schulz orthogonalization for 2D matrices).
 - **HuggingFace Interoperability**: Pure-Geisha `safetensors` reader/writer + `StateDict` auto-deriving (`Named` field paths match `LlamaForCausalLM` 1-to-1) + `config.json` exporter.

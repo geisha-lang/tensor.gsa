@@ -1,6 +1,6 @@
-// Multi-backend `Device` ADT and minimal native shim (`tensor.backend`).
+// Multi-backend `Device` ADT and minimal BLAS FFI (`tensor.backend`).
 // All CPU elementwise, broadcast, norm, reduction, activation, RoPE, PRNG and AdamW kernels
-// run in pure Geisha (`tensor.cpu`); `native/blas.c` provides only BLAS SGEMM/BGEMM + file I/O.
+// run in pure Geisha (`tensor.cpu`); `native/blas.c` provides only BLAS SGEMM/BGEMM.
 
 use std.generic
 
@@ -22,22 +22,9 @@ pub def devId(d: Device): Int = match d {
     Metal(i) -> i,
 }
 
-// ============================================================================
-// Minimal Native FFI (only BLAS GEMM + binary file I/O + CUDA probe)
-// ============================================================================
-
 pub extern noalloc "gs_t_cuda_device_count" def c_cuda_device_count(): Int
 pub extern noalloc "gs_t_sgemm_cpu" def c_sgemm_cpu(ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
 pub extern noalloc "gs_t_bgemm_cpu" def c_bgemm_cpu(batch: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
-
-pub extern "gs_t_fopen_wb" def c_fopen_wb(path: String): Ptr
-pub extern "gs_t_fopen_rb" def c_fopen_rb(path: String): Ptr
-pub extern "gs_t_fclose" def c_fclose(fp: Ptr): Int
-pub extern "gs_t_fwrite_u64_le" def c_fwrite_u64_le(fp: Ptr, v: Int64): Int64
-pub extern "gs_t_fread_u64_le" def c_fread_u64_le(fp: Ptr): Int64
-pub extern "gs_t_fwrite_bytes" def c_fwrite_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
-pub extern "gs_t_fread_bytes" def c_fread_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
-pub extern "gs_t_fwrite_cstr" def c_fwrite_cstr(fp: Ptr, s: String, n: Int64): Int64
 
 pub def cudaDeviceCount(): Int = c_cuda_device_count()
 pub def autoDevice(): Device = if (c_cuda_device_count() > 0) Cuda(0) else Cpu

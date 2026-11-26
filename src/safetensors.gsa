@@ -7,18 +7,17 @@ use std.list.{listRev, listMap}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecToList}
 use std.map.{StrMap, strMapNew, strMapInsert, strMapGet}
 use std.str.intToStr
-use std.buf.{bufNew, bufPushByte, bufToString}
 use std.codec.{Value, VObj, VArr, VStr, VInt, object, array, strVal, i64Val, (:=)}
 use std.json.{parse, stringify, stringifyPretty}
-use sys.fs.writeFile
-use tensor.backend.{
-    Device, Cpu,
-    c_fopen_wb, c_fopen_rb, c_fclose, c_fwrite_u64_le, c_fread_u64_le,
-    c_fwrite_bytes, c_fread_bytes, c_fwrite_cstr
-}
-use tensor.tensor.{
-    Tensor, allocTensorOn, toDevice, tensorDevice
-}
+use sys.fs.{Mmap, writeFile, withMmap}
+use tensor.backend.{Device, Cpu}
+use tensor.tensor.{Tensor, allocTensorOn, toDevice, tensorDevice}
+
+extern "fopen" def c_fopen(path: String, mode: String): Ptr
+extern "fclose" def c_fclose(fp: Ptr): Int
+extern "fwrite" def c_fwrite_buf(buf: ScopedPtr, sz: Int64, n: Int64, fp: Ptr): Int64
+extern "fwrite" def c_fwrite_str(buf: String, sz: Int64, n: Int64, fp: Ptr): Int64
+extern noalloc "memcpy" def c_memcpy_to_scoped(dst: ScopedPtr, src: Ptr, n: Int64): Ptr
 
 // ============================================================================
 // `StateDict` Concept (auto-derivable via `data T : StateDict { ... }`)
@@ -184,19 +183,22 @@ pub def saveSafetensors(path, model): forall m. (StateDict m) => (String, m) -> 
     };
     let headerJson = stringify(object(listRev(cellGet(headerFields))));
     let headerLen = intToI64(strLen(headerJson));
-    let fp = c_fopen_wb(path);
+    let fp = c_fopen(path, "wb");
     if (ptrIsNull(fp)) {
         Err("Failed to open safetensors file for write: " + path)
     } else {
-        let _ = c_fwrite_u64_le(fp, headerLen);
-        let _ = c_fwrite_cstr(fp, headerJson, headerLen);
+        let _ = withAlloca(8, (sp) -> {
+            scopedPtrWriteI64Le(sp, intToI64(0), headerLen);
+            c_fwrite_buf(sp, intToI64(1), intToI64(8), fp)
+        });
+        let _ = c_fwrite_str(headerJson, intToI64(1), headerLen, fp);
         let i = cellNew(0);
         let count = vecLen(hostTensors);
         while (cellGet(i) < count) {
             match vecGet(hostTensors, cellGet(i)) {
                 Some(ht) -> {
                     let nb = intToI64(ht.numel) * intToI64(4);
-                    let _ = c_fwrite_bytes(fp, ht.buf, nb);
+                    let _ = c_fwrite_buf(ht.buf, intToI64(1), nb, fp);
                     ()
                 },
                 None -> (),
@@ -220,65 +222,59 @@ def parseIntList(vs: List Value): List Int = match vs {
 }
 
 pub def loadSafetensors(path, template): forall m. (StateDict m) => (String, m) -> Result m String = {
-    let fp = c_fopen_rb(path);
-    if (ptrIsNull(fp)) {
-        Err("Failed to open safetensors file for read: " + path)
-    } else {
-        let hlen = c_fread_u64_le(fp);
-        if (hlen <= intToI64(0)) {
-            let _ = c_fclose(fp);
-            Err("Invalid safetensors header length")
+    let res = withMmap(path, (mm: Mmap) -> {
+        if (mm.len < intToI64(8)) {
+            Err("Invalid safetensors file: shorter than 8-byte header length")
         } else {
-            let hlenInt = i64ToInt(hlen);
-            let hbuf = foreignPtrAlloc(hlen + intToI64(1));
-            let _ = c_fread_bytes(fp, hbuf, hlen);
-            let headerStr = withForeignPtr(hbuf, (sp) -> {
-                scopedPtrSetByte(sp, hlenInt, 0);
-                let sb = bufNew();
-                let i = cellNew(0);
-                while (cellGet(i) < hlenInt) {
-                    bufPushByte(sb, scopedPtrByteAt(sp, cellGet(i)));
-                    cellSet(i, cellGet(i) + 1)
-                };
-                bufToString(sb)
-            });
-            match parse(headerStr) {
-                Err(e) -> { let _ = c_fclose(fp); Err("Safetensors JSON header error: " + e) },
-                Ok(VObj(entries)) -> {
-                    let tbl = strMapNew();
-                    let cur = cellNew(entries);
-                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                        match cellGet(cur) {
-                            Cons((k, VObj(meta)), r) -> {
-                                if (k != "__metadata__") {
-                                    match (lookupObjField(meta, "shape"), lookupObjField(meta, "data_offsets")) {
-                                        (Some(VArr(shVs)), Some(VArr(Cons(VInt(sOff), Cons(VInt(eOff), Nil))))) -> {
-                                            let sh = parseIntList(shVs);
-                                            let t = allocTensorOn(sh, Cpu);
-                                            let nb = eOff - sOff;
-                                            let _ = c_fread_bytes(fp, t.buf, nb);
-                                            strMapInsert(tbl, k, t)
-                                        },
-                                        _ -> (),
-                                    }
-                                } else ();
-                                cellSet(cur, r)
-                            },
-                            Cons(_, r) -> cellSet(cur, r),
-                            Nil -> (),
+            let hlen = ptrReadI64Le(mm.ptr, 0);
+            if (hlen <= intToI64(0) || intToI64(8) + hlen > mm.len) {
+                Err("Invalid safetensors header length")
+            } else {
+                let hlenInt = i64ToInt(hlen);
+                let headerStr = ptrSliceToString(ptrOffset(mm.ptr, 8), hlenInt);
+                let dataBase = 8 + hlenInt;
+                match parse(headerStr) {
+                    Err(e) -> Err("Safetensors JSON header error: " + e),
+                    Ok(VObj(entries)) -> {
+                        let tbl = strMapNew();
+                        let cur = cellNew(entries);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons((k, VObj(meta)), r) -> {
+                                    if (k != "__metadata__") {
+                                        match (lookupObjField(meta, "shape"), lookupObjField(meta, "data_offsets")) {
+                                            (Some(VArr(shVs)), Some(VArr(Cons(VInt(sOff), Cons(VInt(eOff), Nil))))) -> {
+                                                let sh = parseIntList(shVs);
+                                                let t = allocTensorOn(sh, Cpu);
+                                                let nb = eOff - sOff;
+                                                let srcPtr = ptrOffset(mm.ptr, dataBase + i64ToInt(sOff));
+                                                let _ = c_memcpy_to_scoped(t.buf, srcPtr, nb);
+                                                strMapInsert(tbl, k, t)
+                                            },
+                                            _ -> (),
+                                        }
+                                    } else ();
+                                    cellSet(cur, r)
+                                },
+                                Cons(_, r) -> cellSet(cur, r),
+                                Nil -> (),
+                            }
+                        };
+                        let errCell = cellNew(None);
+                        let restored = loadState("", template, tbl, errCell);
+                        match cellGet(errCell) {
+                            Some(msg) -> Err(msg),
+                            None -> Ok(restored),
                         }
-                    };
-                    let _ = c_fclose(fp);
-                    let errCell = cellNew(None);
-                    let restored = loadState("", template, tbl, errCell);
-                    match cellGet(errCell) {
-                        Some(msg) -> Err(msg),
-                        None -> Ok(restored),
-                    }
-                },
-                Ok(_) -> { let _ = c_fclose(fp); Err("Safetensors header root is not a JSON object") },
+                    },
+                    Ok(_) -> Err("Safetensors header root is not a JSON object"),
+                }
             }
         }
+    });
+    match res {
+        Ok(inner) -> inner,
+        Err(e) -> Err(e),
     }
 }
 
