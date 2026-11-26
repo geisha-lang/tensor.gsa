@@ -36,9 +36,10 @@ let (lm1, st1) = muonStep(defaultMuon(0.03), muonInit(lm0), lm0, grads);
 let _ = saveSafetensors("model.safetensors", lm1);
 ```
 
-## Building with Pure C11 / OpenBLAS / CUDA
+## Multi-Backend Auto-Detection
 
-- **macOS (default)**: `geisha.toml` uses Apple Accelerate automatically.
-- **Linux (pure C11 CPU)**: remove `-framework Accelerate` from `geisha.toml` `link_flags` (uses portable cache-tiled SGEMM in `native/gs_backend_cpu.c`).
-- **Linux (OpenBLAS)**: add `-DGS_TENSOR_OPENBLAS` to `c_flags` and `-lopenblas` to `link_flags`.
-- **Linux (CUDA + cuBLAS)**: compile `native/gs_backend_cuda.cu` with `nvcc -O3 -DGS_TENSOR_CUDA -c`, add `-DGS_TENSOR_CUDA` to `c_flags`, and link `-lcudart -lcublas`.
+`tensor.gsa` declares platform and toolchain rules via `[[target.native.when]]` in `geisha.toml` — downstream apps just add `tensor` to `[deps]` and run `geisha build` / `geisha test` with zero manual flags:
+
+- **macOS**: automatically enables Apple Accelerate (`cblas_sgemm` + `vDSP`).
+- **Linux (CPU)**: automatically detects `openblas` via `pkg-config`, falling back to portable cache-tiled C11.
+- **Linux (NVIDIA GPU)**: automatically detects `nvcc` on `PATH`, compiles `native/gs_backend_cuda.cu`, and links `cudart` + `cublas` (disable with `GEISHA_DISABLE_TOOL=nvcc`).
