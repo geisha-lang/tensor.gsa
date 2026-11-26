@@ -15,11 +15,12 @@ use tensor.backend.{Cpu, Metal}
 use tensor.metal.metalAvailable
 use tensor.tensor.{Tensor, fromList, fromI32List, fromI32ListOn, randnOn, toDevice, getAt, item, shapeEq}
 use tensor.ops.{
-    add, sub, mul, divT, silu, sigmoid, exp, log, square, clamp,
+    add, sub, mul, divT, scale, addScalar, silu, sigmoid, exp, log, square, clamp,
     rmsNorm, layerNorm, l2NormLast, logSumExpLast,
     crossEntropy, crossEntropyIgnore, mseLoss, matmul, matmulNT,
     sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
 }
+use tensor.jit.{jit1, jit2, jitCompileCount, jitCacheHits, checkpoint}
 use tensor.ad.{Params, valueAndGrad, paramCount}
 use tensor.nn.{LMConfig, CausalLM, rngNew, initCausalLM, causalLMFwd}
 use tensor.optim.{
@@ -280,6 +281,45 @@ def testMetalGpu(): Result Void String =
         Ok(())
     }
 
+// 7. Shape-agnostic, scalar-lifted JIT Kernel Fusion + Activation Checkpointing
+def testJitAndCheckpoint(): Result Void String = {
+    // Test CPU single-pass fused JIT parity
+    let xC = randnOn([32, 16], intToI64(101), 0.5, Cpu);
+    let yC = randnOn([32, 16], intToI64(202), 0.5, Cpu);
+    let eagerC = silu(scale(xC, 0.75) + yC) * yC;
+    let fusedC = jit2(xC, yC, (a, b) -> silu(scale(a, 0.75) + b) * b);
+    let _ = assertTrue("jit_cpu_parity", l2NormFloat(fusedC - eagerC) < 1.0e-5)?;
+
+    // Test Metal GPU JIT fusion + zero recompile across shape & scalar changes!
+    if (metalAvailable()) {
+        let c0 = jitCompileCount();
+        let h0 = jitCacheHits();
+        let x1 = randnOn([64, 32], intToI64(303), 0.4, Metal(0));
+        let y1 = randnOn([64, 32], intToI64(404), 0.4, Metal(0));
+        let eager1 = clamp(silu(addScalar(scale(x1, 0.75) + y1, 0.1)) * y1, -2.0, 2.0);
+        let fused1 = jit2(x1, y1, (a, b) -> clamp(silu(addScalar(scale(a, 0.75) + b, 0.1)) * b, -2.0, 2.0));
+        let _ = assertTrue("jit_metal_parity_1", l2NormFloat(toDevice(fused1, Cpu) - toDevice(eager1, Cpu)) < 1.0e-4)?;
+        let _ = assertTrue("jit_compiled_once", jitCompileCount() == c0 + 1)?;
+
+        // Change BOTH shape ([128, 64] != [64, 32]) AND scalars (0.25, -0.3, -1.5, 1.5): MUST BE 0 RECOMPILES!
+        let x2 = randnOn([128, 64], intToI64(505), 0.4, Metal(0));
+        let y2 = randnOn([128, 64], intToI64(606), 0.4, Metal(0));
+        let eager2 = clamp(silu(addScalar(scale(x2, 0.25) + y2, -0.3)) * y2, -1.5, 1.5);
+        let fused2 = jit2(x2, y2, (a, b) -> clamp(silu(addScalar(scale(a, 0.25) + b, -0.3)) * b, -1.5, 1.5));
+        let _ = assertTrue("jit_metal_parity_2", l2NormFloat(toDevice(fused2, Cpu) - toDevice(eager2, Cpu)) < 1.0e-4)?;
+        let _ = assertTrue("jit_zero_recompile_on_shape_and_scalar_change", jitCompileCount() == c0 + 1 && jitCacheHits() == h0 + 1)?;
+        ()
+    } else ();
+
+    // Test Activation Checkpointing gradient parity
+    let w = fromList([3, 4], [0.2, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, -0.3, 0.3, 0.4, -0.2, 0.1]);
+    let x0 = fromList([2, 4], [0.5, -0.3, 0.8, 0.2, -0.4, 0.6, -0.1, 0.9]);
+    let (_, gNormal) = valueAndGrad(x0, (x) -> meanAll(square(silu(matmulNT(x, w)))));
+    let (_, gCkpt) = valueAndGrad(x0, (x) -> meanAll(square(checkpoint(x, (h) -> silu(matmulNT(h, w))))));
+    let _ = assertTrue("checkpoint_grad_exact", l2NormFloat(gNormal - gCkpt) < 1.0e-5)?;
+    Ok(())
+}
+
 def runAll(): Result Void String = {
     let _ = testBroadcasting()?;
     let _ = testUniversalOps()?;
@@ -288,11 +328,12 @@ def runAll(): Result Void String = {
     let _ = testTrainMuon()?;
     let _ = testSafetensorsRoundtrip(trained)?;
     let _ = testMetalGpu()?;
+    let _ = testJitAndCheckpoint()?;
     Ok(())
 }
 
 def main(): Void = match runAll() {
-    Ok(_) -> printLn("PASS [tensor.gsa]: broadcast + universal ops + gradcheck + AdamW + Muon + HF safetensors + Metal/MPS GPU"),
+    Ok(_) -> printLn("PASS [tensor.gsa]: broadcast + ops + gradcheck + AdamW + Muon + HF safetensors + Metal/MPS + JIT fusion + checkpoint"),
     Err(msg) -> {
         eprintLn(msg);
         exit(1)

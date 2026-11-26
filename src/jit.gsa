@@ -1,0 +1,402 @@
+// Shape-Agnostic, Scalar-Lifted JIT Kernel Fusion (`tensor.jit`) + Activation Checkpointing (`checkpoint`).
+//
+// - Traces pure elementwise Geisha functions into a compact DAG (`JitTrace`)
+// - Lifts all scalar constants into a runtime parameter buffer (zero recompile when `lr`/`scale`/`clamp` change!)
+// - Shape & `numel` are passed as runtime arguments (zero recompile when `batch`/`seq_len` change!)
+// - Emits fused Apple Metal MSL shaders (compiled once via `newLibraryWithSource:` & cached by topology signature)
+//   and also supports CUDA C codegen (`emitCudaKernel`) for NVRTC
+// - On CPU, executes the fused DAG in a single allocation-free pass per element
+// - `checkpoint(x, fn)`: O(sqrt(L)) activation checkpointing via `customVjp`
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
+use std.buf.{StringBuf, bufNew, bufPushStr, bufToString}
+use std.str.intToStr
+use tensor.tensor.{
+    Tensor, IrOp, IrInput, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
+    JitTrace, beginJitTrace, endJitTrace, jitStampInput,
+    allocTensorOn, detach, isMetal, syncDevice,
+    getActiveTape, setActiveTape, beginTape, stampLeaf, customVjp, runBackwardWithSeed, zerosLike
+}
+use tensor.metal.{metalCompileCustomKernel, metalDispatchJit}
+
+// ============================================================================
+// Pipeline Cache & Compile Stats
+// ============================================================================
+
+def gJitMetalPipelines: StrMap Ptr = strMapNew()
+def gJitCompileCount: Cell Int = cellNew(0)
+def gJitCacheHits: Cell Int = cellNew(0)
+
+pub def jitCompileCount(): Int = cellGet(gJitCompileCount)
+pub def jitCacheHits(): Int = cellGet(gJitCacheHits)
+
+// ============================================================================
+// Topology Signature (Shape-Agnostic & Scalar-Value-Agnostic!)
+// ============================================================================
+
+def buildTraceSignature(tr: JitTrace, outId: Int): String = {
+    let sb = bufNew();
+    bufPushStr(sb, "in:");
+    bufPushStr(sb, intToStr(vecLen(tr.inputs)));
+    let n = vecLen(tr.nodes);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(tr.nodes, cellGet(i)) {
+            Some(op) -> match op {
+                IrInput(s) -> { bufPushStr(sb, "|I"); bufPushStr(sb, intToStr(s)) },
+                IrBin(k, a, b) -> {
+                    bufPushStr(sb, "|B"); bufPushStr(sb, intToStr(k));
+                    bufPushStr(sb, "("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ","); bufPushStr(sb, intToStr(b)); bufPushStr(sb, ")")
+                },
+                IrUnary(k, a) -> {
+                    bufPushStr(sb, "|U"); bufPushStr(sb, intToStr(k));
+                    bufPushStr(sb, "("); bufPushStr(sb, intToStr(a)); bufPushStr(sb, ")")
+                },
+                IrScale(a, s) -> {
+                    bufPushStr(sb, "|S("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(s)); bufPushStr(sb, ")")
+                },
+                IrAddScalar(a, s) -> {
+                    bufPushStr(sb, "|A("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(s)); bufPushStr(sb, ")")
+                },
+                IrPowScalar(a, s) -> {
+                    bufPushStr(sb, "|P("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(s)); bufPushStr(sb, ")")
+                },
+                IrClamp(a, lo, hi) -> {
+                    bufPushStr(sb, "|C("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(lo));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(hi)); bufPushStr(sb, ")")
+                },
+                IrLeakyRelu(a, s) -> {
+                    bufPushStr(sb, "|L("); bufPushStr(sb, intToStr(a));
+                    bufPushStr(sb, ",c"); bufPushStr(sb, intToStr(s)); bufPushStr(sb, ")")
+                },
+            },
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushStr(sb, "|out:");
+    bufPushStr(sb, intToStr(outId));
+    bufToString(sb)
+}
+
+// ============================================================================
+// Unified Shader Codegen (Apple Metal MSL & NVIDIA CUDA C for NVRTC)
+// ============================================================================
+
+def emitOpBody(sb: StringBuf, tr: JitTrace, outId: Int, isCuda: Bool): Void = {
+    let expFn = if (isCuda) "expf" else "exp";
+    let logFn = if (isCuda) "logf" else "log";
+    let sqrtFn = if (isCuda) "sqrtf" else "sqrt";
+    let rsqrtFn = if (isCuda) "rsqrtf" else "rsqrt";
+    let absFn = if (isCuda) "fabsf" else "fabs";
+    let tanhFn = if (isCuda) "tanhf" else "tanh";
+    let roundFn = if (isCuda) "roundf" else "round";
+    let powFn = if (isCuda) "powf" else "pow";
+
+    let n = vecLen(tr.nodes);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let vn = "v" + intToStr(idx);
+        match vecGet(tr.nodes, idx) {
+            Some(op) -> {
+                bufPushStr(sb, "  float "); bufPushStr(sb, vn); bufPushStr(sb, " = ");
+                match op {
+                    IrInput(slot) -> {
+                        bufPushStr(sb, "in"); bufPushStr(sb, intToStr(slot)); bufPushStr(sb, "[i];\n")
+                    },
+                    IrBin(k, a, b) -> {
+                        let sym = if (k == 0) " + " else if (k == 1) " - " else if (k == 2) " * " else " / ";
+                        bufPushStr(sb, "v"); bufPushStr(sb, intToStr(a));
+                        bufPushStr(sb, sym);
+                        bufPushStr(sb, "v"); bufPushStr(sb, intToStr(b)); bufPushStr(sb, ";\n")
+                    },
+                    IrUnary(k, a) -> {
+                        let va = "v" + intToStr(a);
+                        if (k == 0) { bufPushStr(sb, expFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 1) { bufPushStr(sb, logFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 2) { bufPushStr(sb, sqrtFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 3) { bufPushStr(sb, rsqrtFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 4) { bufPushStr(sb, absFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 5) { bufPushStr(sb, va); bufPushStr(sb, " * "); bufPushStr(sb, va); bufPushStr(sb, ";\n") }
+                        else if (k == 6) { bufPushStr(sb, tanhFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 7) { bufPushStr(sb, "1.0f / (1.0f + "); bufPushStr(sb, expFn); bufPushStr(sb, "(-"); bufPushStr(sb, va); bufPushStr(sb, "));\n") }
+                        else if (k == 8) { bufPushStr(sb, roundFn); bufPushStr(sb, "("); bufPushStr(sb, va); bufPushStr(sb, ");\n") }
+                        else if (k == 9) { bufPushStr(sb, va); bufPushStr(sb, " / (1.0f + "); bufPushStr(sb, expFn); bufPushStr(sb, "(-"); bufPushStr(sb, va); bufPushStr(sb, "));\n") }
+                        else if (k == 10) {
+                            bufPushStr(sb, "0.5f * "); bufPushStr(sb, va);
+                            bufPushStr(sb, " * (1.0f + "); bufPushStr(sb, tanhFn);
+                            bufPushStr(sb, "(0.79788456f * ("); bufPushStr(sb, va);
+                            bufPushStr(sb, " + 0.044715f * "); bufPushStr(sb, va);
+                            bufPushStr(sb, " * "); bufPushStr(sb, va);
+                            bufPushStr(sb, " * "); bufPushStr(sb, va); bufPushStr(sb, ")));\n")
+                        } else {
+                            bufPushStr(sb, va); bufPushStr(sb, " > 0.0f ? "); bufPushStr(sb, va); bufPushStr(sb, " : 0.0f;\n")
+                        }
+                    },
+                    IrScale(a, s) -> {
+                        bufPushStr(sb, "v"); bufPushStr(sb, intToStr(a));
+                        bufPushStr(sb, " * sc["); bufPushStr(sb, intToStr(s)); bufPushStr(sb, "];\n")
+                    },
+                    IrAddScalar(a, s) -> {
+                        bufPushStr(sb, "v"); bufPushStr(sb, intToStr(a));
+                        bufPushStr(sb, " + sc["); bufPushStr(sb, intToStr(s)); bufPushStr(sb, "];\n")
+                    },
+                    IrPowScalar(a, s) -> {
+                        bufPushStr(sb, powFn); bufPushStr(sb, "(v"); bufPushStr(sb, intToStr(a));
+                        bufPushStr(sb, ", sc["); bufPushStr(sb, intToStr(s)); bufPushStr(sb, "]);\n")
+                    },
+                    IrClamp(a, lo, hi) -> {
+                        let va = "v" + intToStr(a);
+                        bufPushStr(sb, va); bufPushStr(sb, " < sc["); bufPushStr(sb, intToStr(lo));
+                        bufPushStr(sb, "] ? sc["); bufPushStr(sb, intToStr(lo));
+                        bufPushStr(sb, "] : ("); bufPushStr(sb, va); bufPushStr(sb, " > sc["); bufPushStr(sb, intToStr(hi));
+                        bufPushStr(sb, "] ? sc["); bufPushStr(sb, intToStr(hi)); bufPushStr(sb, "] : "); bufPushStr(sb, va); bufPushStr(sb, ");\n")
+                    },
+                    IrLeakyRelu(a, s) -> {
+                        let va = "v" + intToStr(a);
+                        bufPushStr(sb, va); bufPushStr(sb, " > 0.0f ? "); bufPushStr(sb, va);
+                        bufPushStr(sb, " : sc["); bufPushStr(sb, intToStr(s)); bufPushStr(sb, "] * "); bufPushStr(sb, va); bufPushStr(sb, ";\n")
+                    },
+                }
+            },
+            None -> (),
+        };
+        cellSet(i, idx + 1)
+    };
+    bufPushStr(sb, "  out0[i] = v"); bufPushStr(sb, intToStr(outId)); bufPushStr(sb, ";\n}\n")
+}
+
+pub def emitMslKernel(tr: JitTrace, outId: Int): String = {
+    let sb = bufNew();
+    bufPushStr(sb, "#include <metal_stdlib>\nusing namespace metal;\nkernel void k_jit(\n");
+    let nIn = vecLen(tr.inputs);
+    let i = cellNew(0);
+    while (cellGet(i) < nIn) {
+        let idx = cellGet(i);
+        bufPushStr(sb, "  device const float* in"); bufPushStr(sb, intToStr(idx));
+        bufPushStr(sb, " [[buffer("); bufPushStr(sb, intToStr(idx)); bufPushStr(sb, ")]],\n");
+        cellSet(i, idx + 1)
+    };
+    bufPushStr(sb, "  device float* out0 [[buffer("); bufPushStr(sb, intToStr(nIn)); bufPushStr(sb, ")]],\n");
+    bufPushStr(sb, "  constant float* sc [[buffer("); bufPushStr(sb, intToStr(nIn + 1)); bufPushStr(sb, ")]],\n");
+    bufPushStr(sb, "  constant uint& n [[buffer("); bufPushStr(sb, intToStr(nIn + 2)); bufPushStr(sb, ")]],\n");
+    bufPushStr(sb, "  uint i [[thread_position_in_grid]]) {\n  if (i >= n) return;\n");
+    emitOpBody(sb, tr, outId, false);
+    bufToString(sb)
+}
+
+pub def emitCudaKernel(tr: JitTrace, outId: Int): String = {
+    let sb = bufNew();
+    bufPushStr(sb, "extern \"C\" __global__ void k_jit(\n");
+    let nIn = vecLen(tr.inputs);
+    let i = cellNew(0);
+    while (cellGet(i) < nIn) {
+        let idx = cellGet(i);
+        bufPushStr(sb, "  const float* in"); bufPushStr(sb, intToStr(idx)); bufPushStr(sb, ",\n");
+        cellSet(i, idx + 1)
+    };
+    bufPushStr(sb, "  float* out0, const float* sc, int n) {\n");
+    bufPushStr(sb, "  int i = blockIdx.x * blockDim.x + threadIdx.x;\n  if (i >= n) return;\n");
+    emitOpBody(sb, tr, outId, true);
+    bufToString(sb)
+}
+
+// ============================================================================
+// Fused Execution (Metal JIT Pipeline Cache + Single-Pass CPU Fused Executor)
+// ============================================================================
+
+def evalNodeCpu(op: IrOp, regs: MutArray Float32, inVals: MutArray Float32, scVals: MutArray Float32): Float32 = {
+    let zero = floatToF32(0.0);
+    let half = floatToF32(0.5);
+    let one = floatToF32(1.0);
+    let gc = floatToF32(0.7978845608);
+    let gk = floatToF32(0.044715);
+    match op {
+        IrInput(s) -> arrayGet(inVals, s),
+        IrBin(k, a, b) -> {
+            let va = arrayGet(regs, a);
+            let vb = arrayGet(regs, b);
+            if (k == 0) va + vb else if (k == 1) va - vb else if (k == 2) va * vb else va / vb
+        },
+        IrUnary(k, a) -> {
+            let v = arrayGet(regs, a);
+            if (k == 0) mathExpF32(v)
+            else if (k == 1) mathLogF32(v)
+            else if (k == 2) mathSqrtF32(v)
+            else if (k == 3) one / mathSqrtF32(v)
+            else if (k == 4) mathAbsF32(v)
+            else if (k == 5) v * v
+            else if (k == 6) mathTanhF32(v)
+            else if (k == 7) one / (one + mathExpF32(zero - v))
+            else if (k == 8) (if (v >= zero) mathFloorF32(v + half) else mathCeilF32(v - half))
+            else if (k == 9) v / (one + mathExpF32(zero - v))
+            else if (k == 10) half * v * (one + mathTanhF32(gc * (v + gk * v * v * v)))
+            else (if (v > zero) v else zero)
+        },
+        IrScale(a, s) -> arrayGet(regs, a) * arrayGet(scVals, s),
+        IrAddScalar(a, s) -> arrayGet(regs, a) + arrayGet(scVals, s),
+        IrPowScalar(a, s) -> mathPowF32(arrayGet(regs, a), arrayGet(scVals, s)),
+        IrClamp(a, lo, hi) -> {
+            let v = arrayGet(regs, a);
+            let l = arrayGet(scVals, lo);
+            let h = arrayGet(scVals, hi);
+            if (v < l) l else if (v > h) h else v
+        },
+        IrLeakyRelu(a, s) -> {
+            let v = arrayGet(regs, a);
+            if (v > zero) v else arrayGet(scVals, s) * v
+        },
+    }
+}
+
+def executeTraceCpu(tr: JitTrace, outId: Int, out: Tensor): Void = {
+    let nNodes = vecLen(tr.nodes);
+    let nIn = vecLen(tr.inputs);
+    let nSc = vecLen(tr.scalars);
+    let regs = arrayNew(if (nNodes > 0) nNodes else 1, floatToF32(0.0));
+    let inVals = arrayNew(if (nIn > 0) nIn else 1, floatToF32(0.0));
+    let scVals = arrayNew(if (nSc > 0) nSc else 1, floatToF32(0.0));
+    let s = cellNew(0);
+    while (cellGet(s) < nSc) {
+        match vecGet(tr.scalars, cellGet(s)) {
+            Some(v) -> arraySet(scVals, cellGet(s), v),
+            None -> (),
+        };
+        cellSet(s, cellGet(s) + 1)
+    };
+    withForeignPtr(out.buf, (po) -> {
+        let i = cellNew(0);
+        while (cellGet(i) < out.numel) {
+            let off = cellGet(i) * 4;
+            let k = cellNew(0);
+            while (cellGet(k) < nIn) {
+                match vecGet(tr.inputs, cellGet(k)) {
+                    Some(tin) -> {
+                        let v = withForeignPtr(tin.buf, (pi) -> scopedPtrReadF32Le(pi, off));
+                        arraySet(inVals, cellGet(k), v)
+                    },
+                    None -> (),
+                };
+                cellSet(k, cellGet(k) + 1)
+            };
+            let j = cellNew(0);
+            while (cellGet(j) < nNodes) {
+                match vecGet(tr.nodes, cellGet(j)) {
+                    Some(op) -> arraySet(regs, cellGet(j), evalNodeCpu(op, regs, inVals, scVals)),
+                    None -> (),
+                };
+                cellSet(j, cellGet(j) + 1)
+            };
+            scopedPtrWriteF32Le(po, off, arrayGet(regs, outId));
+            cellSet(i, cellGet(i) + 1)
+        }
+    })
+}
+
+def executeTrace(tr: JitTrace, symOut: Tensor): Tensor = {
+    let out = allocTensorOn(symOut.shape, symOut.device);
+    if (isMetal(symOut.device)) {
+        let sig = buildTraceSignature(tr, symOut.irId);
+        let pso = match strMapGet(gJitMetalPipelines, sig) {
+            Some(cached) -> {
+                cellSet(gJitCacheHits, cellGet(gJitCacheHits) + 1);
+                cached
+            },
+            None -> {
+                let src = emitMslKernel(tr, symOut.irId);
+                let compiled = metalCompileCustomKernel(src, "k_jit");
+                strMapInsert(gJitMetalPipelines, sig, compiled);
+                cellSet(gJitCompileCount, cellGet(gJitCompileCount) + 1);
+                compiled
+            },
+        };
+        let inGpus = vecNew();
+        let i = cellNew(0);
+        while (cellGet(i) < vecLen(tr.inputs)) {
+            match vecGet(tr.inputs, cellGet(i)) {
+                Some(t) -> vecPush(inGpus, t.gpuBuf),
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        metalDispatchJit(pso, inGpus, out.gpuBuf, tr.scalars, out.numel);
+        out
+    } else {
+        executeTraceCpu(tr, symOut.irId, out);
+        out
+    }
+}
+
+// ============================================================================
+// Public `jit1`, `jit2`, `jit3` & `checkpoint` APIs
+// ============================================================================
+
+pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
+    if (a.nodeId >= 0) f(a)
+    else {
+        let tr = beginJitTrace();
+        let sa = jitStampInput(tr, a);
+        let symOut = f(sa);
+        endJitTrace();
+        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+    }
+
+pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
+    if (a.nodeId >= 0 || b.nodeId >= 0) f(a, b)
+    else {
+        let tr = beginJitTrace();
+        let sa = jitStampInput(tr, a);
+        let sb = jitStampInput(tr, b);
+        let symOut = f(sa, sb);
+        endJitTrace();
+        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+    }
+
+pub def jit3(a: Tensor, b: Tensor, c: Tensor, f: (Tensor, Tensor, Tensor) -> Tensor): Tensor =
+    if (a.nodeId >= 0 || b.nodeId >= 0 || c.nodeId >= 0) f(a, b, c)
+    else {
+        let tr = beginJitTrace();
+        let sa = jitStampInput(tr, a);
+        let sb = jitStampInput(tr, b);
+        let sc = jitStampInput(tr, c);
+        let symOut = f(sa, sb, sc);
+        endJitTrace();
+        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+    }
+
+// Activation Checkpointing: discards intermediate activations during forward pass
+// and recomputes `fn` on a local tape during backward (O(sqrt(L)) memory)!
+pub def checkpoint(x: Tensor, fn: Tensor -> Tensor): Tensor = {
+    let outerTape = getActiveTape();
+    match outerTape {
+        None -> fn(x),
+        Some(_) -> {
+            setActiveTape(None);
+            let xd = detach(x);
+            let out = fn(xd);
+            setActiveTape(outerTape);
+            let xid = x.nodeId;
+            customVjp([xid], out, (gOut: Tensor) -> {
+                let prev = getActiveTape();
+                let localTp = beginTape();
+                let xLeaf = stampLeaf(localTp, xd);
+                let recomputed = fn(xLeaf);
+                let localGrads = runBackwardWithSeed(localTp, recomputed, gOut);
+                setActiveTape(prev);
+                let gx = match vecGet(localGrads, xLeaf.nodeId) {
+                    Some(Some(g)) -> g,
+                    _ -> zerosLike(xd),
+                };
+                [(xid, gx)]
+            })
+        },
+    }
+}

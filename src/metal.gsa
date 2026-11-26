@@ -418,6 +418,75 @@ pub def metalUnary3(kname: String, aGpu: Option ForeignPtr, bGpu: Option Foreign
         },
     }
 
+pub def metalCompileCustomKernel(src: String, fnName: String): Ptr = match getMetalCtx() {
+    None -> ptrNull(),
+    Some(ctx) -> {
+        let pool = c_pool_push();
+        let srcNs = nsString(src);
+        let lib = msg3_ppp(ctx.device, c_sel("newLibraryWithSource:options:error:"), srcNs, ptrNull(), ptrNull());
+        if (ptrIsNull(lib)) {
+            c_pool_pop(pool);
+            ptrNull()
+        } else {
+            let fnObj = msg1_p(lib, c_sel("newFunctionWithName:"), nsString(fnName));
+            let pso = msg2_pp(ctx.device, c_sel("newComputePipelineStateWithFunction:error:"), fnObj, ptrNull());
+            msg0_v(fnObj, c_sel("release"));
+            msg0_v(lib, c_sel("release"));
+            c_pool_pop(pool);
+            pso
+        }
+    },
+}
+
+pub def metalDispatchJit(
+    pso: Ptr,
+    inGpus: Vec (Option ForeignPtr),
+    outGpu: Option ForeignPtr,
+    scalars: Vec Float32,
+    n: Int
+): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> {
+        let pool = c_pool_push();
+        let cb = ensureCmdBuf(ctx);
+        let enc = msg0(cb, c_sel("computeCommandEncoder"));
+        msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+        let selBuf = c_sel("setBuffer:offset:atIndex:");
+        let selBytes = c_sel("setBytes:length:atIndex:");
+        let nIn = vecLen(inGpus);
+        let i = cellNew(0);
+        while (cellGet(i) < nIn) {
+            let idx = cellGet(i);
+            match vecGet(inGpus, idx) {
+                Some(gOpt) -> msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gOpt), intToI64(0), intToI64(idx)),
+                None -> (),
+            };
+            cellSet(i, idx + 1)
+        };
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(nIn));
+        let nSc = vecLen(scalars);
+        let scBytes = if (nSc > 0) nSc * 4 else 4;
+        withAlloca(scBytes, (sp) -> {
+            let k = cellNew(0);
+            while (cellGet(k) < nSc) {
+                match vecGet(scalars, cellGet(k)) {
+                    Some(v) -> scopedPtrWriteF32Le(sp, cellGet(k) * 4, v),
+                    None -> (),
+                };
+                cellSet(k, cellGet(k) + 1)
+            };
+            msg3_v_spi64i64(enc, selBytes, sp, intToI64(scBytes), intToI64(nIn + 1))
+        });
+        withAlloca(4, (nsp) -> {
+            scopedPtrWriteI32Le(nsp, 0, n);
+            msg3_v_spi64i64(enc, selBytes, nsp, intToI64(4), intToI64(nIn + 2))
+        });
+        dispatch1d(enc, n);
+        msg0_v(enc, c_sel("endEncoding"));
+        c_pool_pop(pool)
+    },
+}
+
 pub def metalAdamwStep(
     pGpu: Option ForeignPtr, gGpu: Option ForeignPtr, mGpu: Option ForeignPtr, vGpu: Option ForeignPtr,
     poGpu: Option ForeignPtr, moGpu: Option ForeignPtr, voGpu: Option ForeignPtr,

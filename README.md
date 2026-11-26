@@ -3,7 +3,8 @@
 Functional, zero-boilerplate Deep Learning framework for **Geisha**.
 
 - **Plain ADTs as Models**: `data Linear : Params, StateDict { weight: Tensor, bias: Option Tensor }` — zero `Mk*`, zero proc-macros, zero `.grad` / `zero_grad()`.
-- **Local-Tape Reverse-Mode AD**: `valueAndGrad(model, lossFn)` with `customVjp` hook for fused kernels.
+- **Local-Tape Reverse-Mode AD & Activation Checkpointing**: `valueAndGrad(model, lossFn)`, `customVjp` hook, and `checkpoint(x, fn)` for $O(\sqrt{L})$ activation memory.
+- **Shape-Agnostic, Scalar-Lifted JIT Kernel Fusion (`src/jit.gsa`)**: `jit1` / `jit2` / `jit3` trace elementwise chains into a compact DAG, lift all scalar constants into a runtime buffer, and emit a single fused Metal MSL (or CUDA NVRTC) kernel cached by topology signature — **0 recompilations when shape or scalar hyperparameters change**.
 - **Zero-C macOS Stack (Pure Geisha CPU + Metal/MPS GPU)**:
   - **CPU (`src/cpu.gsa` + `src/backend.gsa`)**: 0 lines of C! All elementwise, N-D broadcasting, reductions, norms, activations, RoPE, PRNG, and fused AdamW kernels are written in pure Geisha; GEMM/BGEMM calls `cblas_sgemm` directly via `extern noalloc` (Apple Accelerate on macOS / OpenBLAS on Linux).
   - **Apple GPU (`src/metal.gsa`)**: 0 lines of C / Objective-C! Direct ARM64 `objc_msgSend` into Apple Metal + `MPSMatrixMultiplication` + runtime-compiled MSL compute shaders + Unified Memory (`MTLResourceStorageModeShared`) + deferred `MTLCommandBuffer` batching.

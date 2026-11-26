@@ -19,6 +19,76 @@ pub data Tensor {
     numel: Int,
     device: Device,
     nodeId: Int,
+    irId: Int,
+}
+
+// ============================================================================
+// Lightweight Elementwise JIT Trace IR (Shape-Agnostic + Scalar-Lifted)
+// ============================================================================
+
+pub data IrOp {
+    IrInput(Int),
+    IrBin(Int, Int, Int),         // op (0=add,1=sub,2=mul,3=div), lhs, rhs
+    IrUnary(Int, Int),            // op (0..11), x
+    IrScale(Int, Int),            // x, scalarIdx
+    IrAddScalar(Int, Int),        // x, scalarIdx
+    IrPowScalar(Int, Int),        // x, scalarIdx
+    IrClamp(Int, Int, Int),       // x, loScalarIdx, hiScalarIdx
+    IrLeakyRelu(Int, Int),        // x, slopeScalarIdx
+}
+
+pub data JitTrace {
+    nodes: Vec IrOp,
+    scalars: Vec Float32,
+    inputs: Vec Tensor,
+}
+
+def activeJitCell: Cell (Option JitTrace) = cellNew(None)
+
+pub def beginJitTrace(): JitTrace = {
+    let tr = JitTrace { nodes: vecNew(), scalars: vecNew(), inputs: vecNew() };
+    cellSet(activeJitCell, Some(tr));
+    tr
+}
+
+pub def endJitTrace(): Void = cellSet(activeJitCell, None)
+
+pub def getActiveJitTrace(): Option JitTrace = cellGet(activeJitCell)
+
+pub def jitPushScalar(tr: JitTrace, v: Float): Int = {
+    let idx = vecLen(tr.scalars);
+    vecPush(tr.scalars, floatToF32(v));
+    idx
+}
+
+pub def jitRecordNode(tr: JitTrace, op: IrOp, sh: List Int, dev: Device): Tensor = {
+    let id = vecLen(tr.nodes);
+    vecPush(tr.nodes, op);
+    Tensor {
+        buf: foreignPtrNew(ptrNull(), ptrNull(), intToI64(0)),
+        gpuBuf: None,
+        shape: sh,
+        numel: shapeProd(sh),
+        device: dev,
+        nodeId: -1,
+        irId: id,
+    }
+}
+
+pub def jitStampInput(tr: JitTrace, t: Tensor): Tensor = {
+    let slot = vecLen(tr.inputs);
+    vecPush(tr.inputs, t);
+    let id = vecLen(tr.nodes);
+    vecPush(tr.nodes, IrInput(slot));
+    Tensor {
+        buf: t.buf,
+        gpuBuf: t.gpuBuf,
+        shape: t.shape,
+        numel: t.numel,
+        device: t.device,
+        nodeId: -1,
+        irId: id,
+    }
 }
 
 pub data IntTensor {
@@ -152,9 +222,9 @@ pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
     match dev {
         Metal(_) -> {
             let (cpuView, gpuOwner) = metalAllocShared(nb);
-            Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1 }
+            Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
         },
-        _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1 },
+        _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 },
     }
 }
 
@@ -247,7 +317,7 @@ pub def toDevice(t: Tensor, dev: Device): Tensor =
     }
 
 pub def detach(t: Tensor): Tensor =
-    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1 }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1, irId: -1 }
 
 pub def getAt(t: Tensor, idx: Int): Float = {
     syncDevice(t.device);
@@ -323,10 +393,13 @@ pub def beginTape(): Tape = {
 
 pub def endTape(): Void = cellSet(activeTapeCell, None)
 
+pub def getActiveTape(): Option Tape = cellGet(activeTapeCell)
+pub def setActiveTape(t: Option Tape): Void = cellSet(activeTapeCell, t)
+
 pub def stampLeaf(tp: Tape, t: Tensor): Tensor = {
     let id = vecLen(tp.nodes);
     vecPush(tp.nodes, TapeNode { bwd: (_) -> Nil });
-    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id, irId: -1 }
 }
 
 def anyTracked(ids: List Int): Bool = match ids {
@@ -341,11 +414,11 @@ pub def customVjp(inputIds: List Int, out: Tensor, bwdFn: Tensor -> List (Int, T
         Some(tp) -> {
             let id = vecLen(tp.nodes);
             vecPush(tp.nodes, TapeNode { bwd: bwdFn });
-            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id }
+            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id, irId: -1 }
         },
     }
 
-pub def runBackward(tp: Tape, loss: Tensor): Vec (Option Tensor) = {
+pub def runBackwardWithSeed(tp: Tape, loss: Tensor, seedGrad: Tensor): Vec (Option Tensor) = {
     let n = vecLen(tp.nodes);
     let grads = vecNew();
     let i = cellNew(0);
@@ -354,7 +427,7 @@ pub def runBackward(tp: Tape, loss: Tensor): Vec (Option Tensor) = {
         cellSet(i, cellGet(i) + 1)
     };
     if (loss.nodeId >= 0 && loss.nodeId < n) {
-        vecSet(grads, loss.nodeId, Some(onesLike(loss)))
+        vecSet(grads, loss.nodeId, Some(seedGrad))
     } else ();
     let k = cellNew(n - 1);
     while (cellGet(k) >= 0) {
@@ -387,3 +460,6 @@ pub def runBackward(tp: Tape, loss: Tensor): Vec (Option Tensor) = {
     };
     grads
 }
+
+pub def runBackward(tp: Tape, loss: Tensor): Vec (Option Tensor) =
+    runBackwardWithSeed(tp, loss, onesLike(loss))
