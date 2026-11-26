@@ -19,23 +19,11 @@ int32_t gs_t_cuda_device_count(void) {
 #endif
 }
 
-const char *gs_t_backend_name(int32_t dev_kind) {
-    return backend_for(dev_kind)->name;
-}
+const char *gs_t_backend_name(int32_t dev_kind) { return backend_for(dev_kind)->name; }
+void *gs_t_alloc(int32_t dev_kind, int32_t dev_id, int64_t nbytes) { return backend_for(dev_kind)->alloc(dev_id, nbytes); }
+void *gs_t_free_fn(int32_t dev_kind) { return (void *)backend_for(dev_kind)->free_ptr; }
 
-void *gs_t_alloc(int32_t dev_kind, int32_t dev_id, int64_t nbytes) {
-    return backend_for(dev_kind)->alloc(dev_id, nbytes);
-}
-
-void *gs_t_free_fn(int32_t dev_kind) {
-    return (void *)backend_for(dev_kind)->free_ptr;
-}
-
-void gs_t_memcpy_dev(
-    void *dst, int32_t dst_kind, int32_t dst_id,
-    const void *src, int32_t src_kind, int32_t src_id,
-    int64_t nbytes
-) {
+void gs_t_memcpy_dev(void *dst, int32_t dst_kind, int32_t dst_id, const void *src, int32_t src_kind, int32_t src_id, int64_t nbytes) {
     if (nbytes <= 0) return;
     if (dst_kind == GS_DEV_CPU && src_kind == GS_DEV_CPU) {
         gs_backend_cpu.copy_d2d(0, dst, src, nbytes);
@@ -65,24 +53,42 @@ void gs_t_copy(int32_t dk, int32_t did, float *dst, const float *src, int64_t n)
 void gs_t_add(int32_t dk, int32_t did, const float *a, const float *b, float *out, int64_t n) { backend_for(dk)->add(did, a, b, out, n); }
 void gs_t_sub(int32_t dk, int32_t did, const float *a, const float *b, float *out, int64_t n) { backend_for(dk)->sub(did, a, b, out, n); }
 void gs_t_mul(int32_t dk, int32_t did, const float *a, const float *b, float *out, int64_t n) { backend_for(dk)->mul(did, a, b, out, n); }
+void gs_t_div_ew(int32_t dk, int32_t did, const float *a, const float *b, float *out, int64_t n) { backend_for(dk)->div_ew(did, a, b, out, n); }
 void gs_t_scale(int32_t dk, int32_t did, const float *a, float s, float *out, int64_t n) { backend_for(dk)->scale(did, a, s, out, n); }
+void gs_t_add_scalar(int32_t dk, int32_t did, const float *a, float s, float *out, int64_t n) { backend_for(dk)->add_scalar(did, a, s, out, n); }
+void gs_t_pow_scalar_fwd(int32_t dk, int32_t did, const float *a, float p, float *out, int64_t n) { backend_for(dk)->pow_scalar_fwd(did, a, p, out, n); }
+void gs_t_pow_scalar_bwd(int32_t dk, int32_t did, const float *a, const float *gy, float p, float *gx, int64_t n) { backend_for(dk)->pow_scalar_bwd(did, a, gy, p, gx, n); }
+void gs_t_clamp_fwd(int32_t dk, int32_t did, const float *a, float lo, float hi, float *out, int64_t n) { backend_for(dk)->clamp_fwd(did, a, lo, hi, out, n); }
+void gs_t_clamp_bwd(int32_t dk, int32_t did, const float *a, const float *gy, float lo, float hi, float *gx, int64_t n) { backend_for(dk)->clamp_bwd(did, a, gy, lo, hi, gx, n); }
+void gs_t_leaky_relu_fwd(int32_t dk, int32_t did, const float *a, float slope, float *out, int64_t n) { backend_for(dk)->leaky_relu_fwd(did, a, slope, out, n); }
+void gs_t_leaky_relu_bwd(int32_t dk, int32_t did, const float *a, const float *gy, float slope, float *gx, int64_t n) { backend_for(dk)->leaky_relu_bwd(did, a, gy, slope, gx, n); }
 void gs_t_axpy(int32_t dk, int32_t did, float alpha, const float *x, float *y, int64_t n) { backend_for(dk)->axpy(did, alpha, x, y, n); }
-void gs_t_add_row_bias(int32_t dk, int32_t did, const float *x, const float *bias, float *out, int32_t rows, int32_t cols) { backend_for(dk)->add_row_bias(did, x, bias, out, rows, cols); }
-void gs_t_sum_rows(int32_t dk, int32_t did, const float *x, float *out, int32_t rows, int32_t cols) { backend_for(dk)->sum_rows(did, x, out, rows, cols); }
-void gs_t_silu_fwd(int32_t dk, int32_t did, const float *x, float *out, int64_t n) { backend_for(dk)->silu_fwd(did, x, out, n); }
-void gs_t_silu_bwd(int32_t dk, int32_t did, const float *x, const float *gy, float *gx, int64_t n) { backend_for(dk)->silu_bwd(did, x, gy, gx, n); }
-void gs_t_gelu_fwd(int32_t dk, int32_t did, const float *x, float *out, int64_t n) { backend_for(dk)->gelu_fwd(did, x, out, n); }
-void gs_t_gelu_bwd(int32_t dk, int32_t did, const float *x, const float *gy, float *gx, int64_t n) { backend_for(dk)->gelu_bwd(did, x, gy, gx, n); }
-void gs_t_relu_fwd(int32_t dk, int32_t did, const float *x, float *out, int64_t n) { backend_for(dk)->relu_fwd(did, x, out, n); }
-void gs_t_relu_bwd(int32_t dk, int32_t did, const float *x, const float *gy, float *gx, int64_t n) { backend_for(dk)->relu_bwd(did, x, gy, gx, n); }
+void gs_t_bcast_binop(int32_t dk, int32_t did, int32_t op, int32_t ndim, int64_t total, const int32_t *out_shape, const int32_t *a_strides, const int32_t *b_strides, const float *a, const float *b, float *out) {
+    backend_for(dk)->bcast_binop(did, op, ndim, total, out_shape, a_strides, b_strides, a, b, out);
+}
+void gs_t_bcast_reduce_sum(int32_t dk, int32_t did, int32_t ndim, int64_t src_total, int64_t dst_total, const int32_t *src_shape, const int32_t *dst_strides, const float *src, float *dst) {
+    backend_for(dk)->bcast_reduce_sum(did, ndim, src_total, dst_total, src_shape, dst_strides, src, dst);
+}
+void gs_t_unary_fwd(int32_t dk, int32_t did, int32_t op, const float *x, float *out, int64_t n) { backend_for(dk)->unary_fwd(did, op, x, out, n); }
+void gs_t_unary_bwd(int32_t dk, int32_t did, int32_t op, const float *x, const float *y, const float *gy, float *gx, int64_t n) { backend_for(dk)->unary_bwd(did, op, x, y, gy, gx, n); }
+void gs_t_slice_axis_fwd(int32_t dk, int32_t did, const float *x, float *out, int32_t outer, int32_t in_dim, int32_t inner, int32_t start, int32_t len) { backend_for(dk)->slice_axis_fwd(did, x, out, outer, in_dim, inner, start, len); }
+void gs_t_slice_axis_bwd(int32_t dk, int32_t did, const float *gy, float *gx, int32_t outer, int32_t in_dim, int32_t inner, int32_t start, int32_t len) { backend_for(dk)->slice_axis_bwd(did, gy, gx, outer, in_dim, inner, start, len); }
+void gs_t_sum_axis(int32_t dk, int32_t did, const float *x, float *out, int32_t outer, int32_t dim, int32_t inner) { backend_for(dk)->sum_axis(did, x, out, outer, dim, inner); }
+void gs_t_max_axis(int32_t dk, int32_t did, const float *x, float *out, int32_t outer, int32_t dim, int32_t inner) { backend_for(dk)->max_axis(did, x, out, outer, dim, inner); }
 float gs_t_sum_all(int32_t dk, int32_t did, const float *x, int64_t n) { return backend_for(dk)->sum_all(did, x, n); }
 float gs_t_sum_sq(int32_t dk, int32_t did, const float *x, int64_t n) { return backend_for(dk)->sum_sq(did, x, n); }
 void gs_t_rms_norm_fwd(int32_t dk, int32_t did, const float *x, const float *w, float *out, int32_t rows, int32_t dim, float eps) { backend_for(dk)->rms_norm_fwd(did, x, w, out, rows, dim, eps); }
 void gs_t_rms_norm_bwd(int32_t dk, int32_t did, const float *x, const float *w, const float *gy, float *gx, float *gw, int32_t rows, int32_t dim, float eps) { backend_for(dk)->rms_norm_bwd(did, x, w, gy, gx, gw, rows, dim, eps); }
+void gs_t_layer_norm_fwd(int32_t dk, int32_t did, const float *x, const float *w, const float *b, float *out, int32_t rows, int32_t dim, float eps) { backend_for(dk)->layer_norm_fwd(did, x, w, b, out, rows, dim, eps); }
+void gs_t_layer_norm_bwd(int32_t dk, int32_t did, const float *x, const float *w, const float *gy, float *gx, float *gw, float *gb, int32_t rows, int32_t dim, float eps) { backend_for(dk)->layer_norm_bwd(did, x, w, gy, gx, gw, gb, rows, dim, eps); }
+void gs_t_l2_norm_last_fwd(int32_t dk, int32_t did, const float *x, float *out, int32_t rows, int32_t dim, float eps) { backend_for(dk)->l2_norm_last_fwd(did, x, out, rows, dim, eps); }
+void gs_t_l2_norm_last_bwd(int32_t dk, int32_t did, const float *x, const float *gy, float *gx, int32_t rows, int32_t dim, float eps) { backend_for(dk)->l2_norm_last_bwd(did, x, gy, gx, rows, dim, eps); }
 void gs_t_softmax_fwd(int32_t dk, int32_t did, const float *x, float *out, int32_t rows, int32_t cols) { backend_for(dk)->softmax_fwd(did, x, out, rows, cols); }
 void gs_t_softmax_bwd(int32_t dk, int32_t did, const float *y, const float *gy, float *gx, int32_t rows, int32_t cols) { backend_for(dk)->softmax_bwd(did, y, gy, gx, rows, cols); }
-float gs_t_cross_entropy_fwd(int32_t dk, int32_t did, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab) { return backend_for(dk)->cross_entropy_fwd(did, logits, targets, probs_out, rows, vocab); }
-void gs_t_cross_entropy_bwd(int32_t dk, int32_t did, const float *probs, const int32_t *targets, float g_loss, float *g_logits, int32_t rows, int32_t vocab) { backend_for(dk)->cross_entropy_bwd(did, probs, targets, g_loss, g_logits, rows, vocab); }
+void gs_t_log_sum_exp_fwd(int32_t dk, int32_t did, const float *x, float *out, int32_t rows, int32_t cols) { backend_for(dk)->log_sum_exp_fwd(did, x, out, rows, cols); }
+void gs_t_log_sum_exp_bwd(int32_t dk, int32_t did, const float *x, const float *lse, const float *gy, float *gx, int32_t rows, int32_t cols) { backend_for(dk)->log_sum_exp_bwd(did, x, lse, gy, gx, rows, cols); }
+float gs_t_cross_entropy_fwd(int32_t dk, int32_t did, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab, int32_t ignore_idx) { return backend_for(dk)->cross_entropy_fwd(did, logits, targets, probs_out, rows, vocab, ignore_idx); }
+void gs_t_cross_entropy_bwd(int32_t dk, int32_t did, const float *probs, const int32_t *targets, float g_loss, float *g_logits, int32_t rows, int32_t vocab, int32_t ignore_idx) { backend_for(dk)->cross_entropy_bwd(did, probs, targets, g_loss, g_logits, rows, vocab, ignore_idx); }
 void gs_t_embedding_fwd(int32_t dk, int32_t did, const float *table, const int32_t *ids, float *out, int32_t n_ids, int32_t dim) { backend_for(dk)->embedding_fwd(did, table, ids, out, n_ids, dim); }
 void gs_t_embedding_bwd(int32_t dk, int32_t did, const int32_t *ids, const float *gy, float *g_table, int32_t n_ids, int32_t vocab, int32_t dim) { backend_for(dk)->embedding_bwd(did, ids, gy, g_table, n_ids, vocab, dim); }
 void gs_t_rope_fwd(int32_t dk, int32_t did, const float *x, float *out, int32_t batch, int32_t seq, int32_t heads, int32_t head_dim, float theta) { backend_for(dk)->rope_fwd(did, x, out, batch, seq, heads, head_dim, theta); }
@@ -118,21 +124,7 @@ int64_t gs_t_fread_u64_le(void *fp) {
     return (int64_t)u;
 }
 
-int64_t gs_t_fwrite_bytes(void *fp, const void *ptr, int64_t n) {
-    if (n <= 0) return 0;
-    return (int64_t)fwrite(ptr, 1, (size_t)n, (FILE *)fp);
-}
-
-int64_t gs_t_fread_bytes(void *fp, void *ptr, int64_t n) {
-    if (n <= 0) return 0;
-    return (int64_t)fread(ptr, 1, (size_t)n, (FILE *)fp);
-}
-
-int32_t gs_t_fseek_set(void *fp, int64_t offset) {
-    return fseek((FILE *)fp, (long)offset, SEEK_SET);
-}
-
-int64_t gs_t_fwrite_cstr(void *fp, const char *s, int64_t n) {
-    if (n <= 0) return 0;
-    return (int64_t)fwrite(s, 1, (size_t)n, (FILE *)fp);
-}
+int64_t gs_t_fwrite_bytes(void *fp, const void *ptr, int64_t n) { return n > 0 ? (int64_t)fwrite(ptr, 1, (size_t)n, (FILE *)fp) : 0; }
+int64_t gs_t_fread_bytes(void *fp, void *ptr, int64_t n) { return n > 0 ? (int64_t)fread(ptr, 1, (size_t)n, (FILE *)fp) : 0; }
+int32_t gs_t_fseek_set(void *fp, int64_t offset) { return fseek((FILE *)fp, (long)offset, SEEK_SET); }
+int64_t gs_t_fwrite_cstr(void *fp, const char *s, int64_t n) { return n > 0 ? (int64_t)fwrite(s, 1, (size_t)n, (FILE *)fp) : 0; }

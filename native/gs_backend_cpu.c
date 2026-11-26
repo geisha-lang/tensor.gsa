@@ -53,7 +53,6 @@ static void cpu_sgemm(
         beta, C, ldc
     );
 #else
-    // Portable cache-tiled SGEMM (works on any CPU without BLAS)
     if (beta == 0.0f) {
         memset(C, 0, (size_t)((int64_t)M * N) * sizeof(float));
     } else if (beta != 1.0f) {
@@ -141,6 +140,16 @@ static void cpu_mul(int32_t dev_id, const float *a, const float *b, float *out, 
 #endif
 }
 
+static void cpu_div_ew(int32_t dev_id, const float *a, const float *b, float *out, int64_t n) {
+    (void)dev_id;
+#ifdef GS_HAS_VDSP
+    // vDSP_vdiv computes C = B / A
+    vDSP_vdiv(b, 1, a, 1, out, 1, (vDSP_Length)n);
+#else
+    for (int64_t i = 0; i < n; i++) out[i] = a[i] / b[i];
+#endif
+}
+
 static void cpu_scale(int32_t dev_id, const float *a, float s, float *out, int64_t n) {
     (void)dev_id;
 #ifdef GS_HAS_VDSP
@@ -148,6 +157,51 @@ static void cpu_scale(int32_t dev_id, const float *a, float s, float *out, int64
 #else
     for (int64_t i = 0; i < n; i++) out[i] = a[i] * s;
 #endif
+}
+
+static void cpu_add_scalar(int32_t dev_id, const float *a, float s, float *out, int64_t n) {
+    (void)dev_id;
+#ifdef GS_HAS_VDSP
+    vDSP_vsadd(a, 1, &s, out, 1, (vDSP_Length)n);
+#else
+    for (int64_t i = 0; i < n; i++) out[i] = a[i] + s;
+#endif
+}
+
+static void cpu_pow_scalar_fwd(int32_t dev_id, const float *a, float p, float *out, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) out[i] = powf(a[i], p);
+}
+
+static void cpu_pow_scalar_bwd(int32_t dev_id, const float *a, const float *gy, float p, float *gx, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) gx[i] = gy[i] * p * powf(a[i], p - 1.0f);
+}
+
+static void cpu_clamp_fwd(int32_t dev_id, const float *a, float lo, float hi, float *out, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) {
+        float v = a[i];
+        out[i] = v < lo ? lo : (v > hi ? hi : v);
+    }
+}
+
+static void cpu_clamp_bwd(int32_t dev_id, const float *a, const float *gy, float lo, float hi, float *gx, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) {
+        float v = a[i];
+        gx[i] = (v >= lo && v <= hi) ? gy[i] : 0.0f;
+    }
+}
+
+static void cpu_leaky_relu_fwd(int32_t dev_id, const float *a, float slope, float *out, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) out[i] = a[i] > 0.0f ? a[i] : slope * a[i];
+}
+
+static void cpu_leaky_relu_bwd(int32_t dev_id, const float *a, const float *gy, float slope, float *gx, int64_t n) {
+    (void)dev_id;
+    for (int64_t i = 0; i < n; i++) gx[i] = a[i] > 0.0f ? gy[i] : slope * gy[i];
 }
 
 static void cpu_axpy(int32_t dev_id, float alpha, const float *x, float *y, int64_t n) {
@@ -159,72 +213,132 @@ static void cpu_axpy(int32_t dev_id, float alpha, const float *x, float *y, int6
 #endif
 }
 
-static void cpu_add_row_bias(int32_t dev_id, const float *x, const float *bias, float *out, int32_t rows, int32_t cols) {
+static void cpu_bcast_binop(
+    int32_t dev_id, int32_t op, int32_t ndim, int64_t total,
+    const int32_t *out_shape, const int32_t *a_strides, const int32_t *b_strides,
+    const float *a, const float *b, float *out
+) {
     (void)dev_id;
-    for (int32_t r = 0; r < rows; r++) {
-        const float *xr = x + (int64_t)r * cols;
-        float *orow = out + (int64_t)r * cols;
-        for (int32_t c = 0; c < cols; c++) orow[c] = xr[c] + bias[c];
+    for (int64_t idx = 0; idx < total; idx++) {
+        int64_t rem = idx;
+        int64_t oa = 0, ob = 0;
+        for (int32_t d = ndim - 1; d >= 0; d--) {
+            int32_t coord = (int32_t)(rem % out_shape[d]);
+            rem /= out_shape[d];
+            oa += (int64_t)coord * a_strides[d];
+            ob += (int64_t)coord * b_strides[d];
+        }
+        float va = a[oa], vb = b[ob];
+        if (op == GS_BOP_ADD)      out[idx] = va + vb;
+        else if (op == GS_BOP_SUB) out[idx] = va - vb;
+        else if (op == GS_BOP_MUL) out[idx] = va * vb;
+        else                       out[idx] = va / vb;
     }
 }
 
-static void cpu_sum_rows(int32_t dev_id, const float *x, float *out, int32_t rows, int32_t cols) {
+static void cpu_bcast_reduce_sum(
+    int32_t dev_id, int32_t ndim, int64_t src_total, int64_t dst_total,
+    const int32_t *src_shape, const int32_t *dst_strides,
+    const float *src, float *dst
+) {
     (void)dev_id;
-    memset(out, 0, (size_t)cols * sizeof(float));
-    for (int32_t r = 0; r < rows; r++) {
-        const float *xr = x + (int64_t)r * cols;
-        for (int32_t c = 0; c < cols; c++) out[c] += xr[c];
+    memset(dst, 0, (size_t)dst_total * sizeof(float));
+    for (int64_t idx = 0; idx < src_total; idx++) {
+        int64_t rem = idx;
+        int64_t od = 0;
+        for (int32_t d = ndim - 1; d >= 0; d--) {
+            int32_t coord = (int32_t)(rem % src_shape[d]);
+            rem /= src_shape[d];
+            od += (int64_t)coord * dst_strides[d];
+        }
+        dst[od] += src[idx];
     }
 }
 
-static void cpu_silu_fwd(int32_t dev_id, const float *x, float *out, int64_t n) {
+static void cpu_unary_fwd(int32_t dev_id, int32_t op, const float *x, float *out, int64_t n) {
     (void)dev_id;
-    for (int64_t i = 0; i < n; i++) {
-        float v = x[i];
-        float sig = 1.0f / (1.0f + expf(-v));
-        out[i] = v * sig;
+    const float gc = 0.7978845608028654f;
+    switch (op) {
+        case GS_UOP_EXP:     for (int64_t i = 0; i < n; i++) out[i] = expf(x[i]); break;
+        case GS_UOP_LOG:     for (int64_t i = 0; i < n; i++) out[i] = logf(x[i]); break;
+        case GS_UOP_SQRT:    for (int64_t i = 0; i < n; i++) out[i] = sqrtf(x[i]); break;
+        case GS_UOP_RSQRT:   for (int64_t i = 0; i < n; i++) out[i] = 1.0f / sqrtf(x[i]); break;
+        case GS_UOP_ABS:     for (int64_t i = 0; i < n; i++) out[i] = fabsf(x[i]); break;
+        case GS_UOP_SQUARE:  for (int64_t i = 0; i < n; i++) out[i] = x[i] * x[i]; break;
+        case GS_UOP_TANH:    for (int64_t i = 0; i < n; i++) out[i] = tanhf(x[i]); break;
+        case GS_UOP_SIGMOID: for (int64_t i = 0; i < n; i++) out[i] = 1.0f / (1.0f + expf(-x[i])); break;
+        case GS_UOP_ROUND:   for (int64_t i = 0; i < n; i++) out[i] = roundf(x[i]); break;
+        case GS_UOP_SILU:    for (int64_t i = 0; i < n; i++) { float v = x[i]; out[i] = v / (1.0f + expf(-v)); } break;
+        case GS_UOP_GELU:    for (int64_t i = 0; i < n; i++) { float v = x[i]; out[i] = 0.5f * v * (1.0f + tanhf(gc * (v + 0.044715f * v * v * v))); } break;
+        case GS_UOP_RELU:    for (int64_t i = 0; i < n; i++) out[i] = x[i] > 0.0f ? x[i] : 0.0f; break;
+        default: break;
     }
 }
 
-static void cpu_silu_bwd(int32_t dev_id, const float *x, const float *gy, float *gx, int64_t n) {
+static void cpu_unary_bwd(int32_t dev_id, int32_t op, const float *x, const float *y, const float *gy, float *gx, int64_t n) {
     (void)dev_id;
-    for (int64_t i = 0; i < n; i++) {
-        float v = x[i];
-        float sig = 1.0f / (1.0f + expf(-v));
-        gx[i] = gy[i] * sig * (1.0f + v * (1.0f - sig));
+    const float gc = 0.7978845608028654f;
+    switch (op) {
+        case GS_UOP_EXP:     for (int64_t i = 0; i < n; i++) gx[i] = gy[i] * y[i]; break;
+        case GS_UOP_LOG:     for (int64_t i = 0; i < n; i++) gx[i] = gy[i] / x[i]; break;
+        case GS_UOP_SQRT:    for (int64_t i = 0; i < n; i++) gx[i] = gy[i] / (2.0f * y[i] + 1e-12f); break;
+        case GS_UOP_RSQRT:   for (int64_t i = 0; i < n; i++) { float r = y[i]; gx[i] = -0.5f * gy[i] * r * r * r; } break;
+        case GS_UOP_ABS:     for (int64_t i = 0; i < n; i++) gx[i] = x[i] > 0.0f ? gy[i] : (x[i] < 0.0f ? -gy[i] : 0.0f); break;
+        case GS_UOP_SQUARE:  for (int64_t i = 0; i < n; i++) gx[i] = 2.0f * x[i] * gy[i]; break;
+        case GS_UOP_TANH:    for (int64_t i = 0; i < n; i++) gx[i] = gy[i] * (1.0f - y[i] * y[i]); break;
+        case GS_UOP_SIGMOID: for (int64_t i = 0; i < n; i++) gx[i] = gy[i] * y[i] * (1.0f - y[i]); break;
+        case GS_UOP_ROUND:   for (int64_t i = 0; i < n; i++) gx[i] = 0.0f; break;
+        case GS_UOP_SILU:    for (int64_t i = 0; i < n; i++) { float v = x[i]; float s = 1.0f / (1.0f + expf(-v)); gx[i] = gy[i] * s * (1.0f + v * (1.0f - s)); } break;
+        case GS_UOP_GELU:    for (int64_t i = 0; i < n; i++) { float v = x[i], v2 = v * v; float th = tanhf(gc * (v + 0.044715f * v * v2)); gx[i] = gy[i] * (0.5f * (1.0f + th) + 0.5f * v * (1.0f - th * th) * gc * (1.0f + 0.134145f * v2)); } break;
+        case GS_UOP_RELU:    for (int64_t i = 0; i < n; i++) gx[i] = x[i] > 0.0f ? gy[i] : 0.0f; break;
+        default: break;
     }
 }
 
-static void cpu_gelu_fwd(int32_t dev_id, const float *x, float *out, int64_t n) {
+static void cpu_slice_axis_fwd(int32_t dev_id, const float *x, float *out, int32_t outer, int32_t in_dim, int32_t inner, int32_t start, int32_t len) {
     (void)dev_id;
-    const float c = 0.7978845608028654f;
-    for (int64_t i = 0; i < n; i++) {
-        float v = x[i];
-        out[i] = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
+    int64_t chunk_bytes = (int64_t)len * inner * (int64_t)sizeof(float);
+    for (int32_t o = 0; o < outer; o++) {
+        const float *src = x + ((int64_t)o * in_dim + start) * inner;
+        float *dst = out + (int64_t)o * len * inner;
+        memcpy(dst, src, (size_t)chunk_bytes);
     }
 }
 
-static void cpu_gelu_bwd(int32_t dev_id, const float *x, const float *gy, float *gx, int64_t n) {
+static void cpu_slice_axis_bwd(int32_t dev_id, const float *gy, float *gx, int32_t outer, int32_t in_dim, int32_t inner, int32_t start, int32_t len) {
     (void)dev_id;
-    const float c = 0.7978845608028654f;
-    for (int64_t i = 0; i < n; i++) {
-        float v = x[i];
-        float v2 = v * v;
-        float th = tanhf(c * (v + 0.044715f * v * v2));
-        float sech2 = 1.0f - th * th;
-        float dinner = c * (1.0f + 3.0f * 0.044715f * v2);
-        gx[i] = gy[i] * (0.5f * (1.0f + th) + 0.5f * v * sech2 * dinner);
+    memset(gx, 0, (size_t)((int64_t)outer * in_dim * inner) * sizeof(float));
+    int64_t chunk_bytes = (int64_t)len * inner * (int64_t)sizeof(float);
+    for (int32_t o = 0; o < outer; o++) {
+        const float *src = gy + (int64_t)o * len * inner;
+        float *dst = gx + ((int64_t)o * in_dim + start) * inner;
+        memcpy(dst, src, (size_t)chunk_bytes);
     }
 }
 
-static void cpu_relu_fwd(int32_t dev_id, const float *x, float *out, int64_t n) {
+static void cpu_sum_axis(int32_t dev_id, const float *x, float *out, int32_t outer, int32_t dim, int32_t inner) {
     (void)dev_id;
-    for (int64_t i = 0; i < n; i++) out[i] = x[i] > 0.0f ? x[i] : 0.0f;
+    memset(out, 0, (size_t)((int64_t)outer * inner) * sizeof(float));
+    for (int32_t o = 0; o < outer; o++) {
+        float *orow = out + (int64_t)o * inner;
+        for (int32_t d = 0; d < dim; d++) {
+            const float *xrow = x + ((int64_t)o * dim + d) * inner;
+            for (int32_t k = 0; k < inner; k++) orow[k] += xrow[k];
+        }
+    }
 }
 
-static void cpu_relu_bwd(int32_t dev_id, const float *x, const float *gy, float *gx, int64_t n) {
+static void cpu_max_axis(int32_t dev_id, const float *x, float *out, int32_t outer, int32_t dim, int32_t inner) {
     (void)dev_id;
-    for (int64_t i = 0; i < n; i++) gx[i] = x[i] > 0.0f ? gy[i] : 0.0f;
+    for (int32_t o = 0; o < outer; o++) {
+        float *orow = out + (int64_t)o * inner;
+        const float *x0 = x + ((int64_t)o * dim) * inner;
+        memcpy(orow, x0, (size_t)inner * sizeof(float));
+        for (int32_t d = 1; d < dim; d++) {
+            const float *xrow = x + ((int64_t)o * dim + d) * inner;
+            for (int32_t k = 0; k < inner; k++) if (xrow[k] > orow[k]) orow[k] = xrow[k];
+        }
+    }
 }
 
 static float cpu_sum_all(int32_t dev_id, const float *x, int64_t n) {
@@ -274,6 +388,93 @@ static void cpu_rms_norm_bwd(int32_t dev_id, const float *x, const float *w, con
     }
 }
 
+static void cpu_layer_norm_fwd(int32_t dev_id, const float *x, const float *w, const float *b, float *out, int32_t rows, int32_t dim, float eps) {
+    (void)dev_id;
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * dim;
+        float *orow = out + (int64_t)r * dim;
+        double mean = 0.0;
+        for (int32_t c = 0; c < dim; c++) mean += (double)xr[c];
+        mean /= (double)dim;
+        double var = 0.0;
+        for (int32_t c = 0; c < dim; c++) { double d = (double)xr[c] - mean; var += d * d; }
+        float inv_std = 1.0f / sqrtf((float)(var / (double)dim) + eps);
+        for (int32_t c = 0; c < dim; c++) {
+            float xhat = ((float)((double)xr[c] - mean)) * inv_std;
+            orow[c] = xhat * w[c] + (b ? b[c] : 0.0f);
+        }
+    }
+}
+
+static void cpu_layer_norm_bwd(int32_t dev_id, const float *x, const float *w, const float *gy, float *gx, float *gw, float *gb, int32_t rows, int32_t dim, float eps) {
+    (void)dev_id;
+    memset(gw, 0, (size_t)dim * sizeof(float));
+    if (gb) memset(gb, 0, (size_t)dim * sizeof(float));
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * dim;
+        const float *gyr = gy + (int64_t)r * dim;
+        float *gxr = gx + (int64_t)r * dim;
+        double mean = 0.0;
+        for (int32_t c = 0; c < dim; c++) mean += (double)xr[c];
+        mean /= (double)dim;
+        double var = 0.0;
+        for (int32_t c = 0; c < dim; c++) { double d = (double)xr[c] - mean; var += d * d; }
+        float inv_std = 1.0f / sqrtf((float)(var / (double)dim) + eps);
+        double sum1 = 0.0, sum2 = 0.0;
+        for (int32_t c = 0; c < dim; c++) {
+            float xhat = ((float)((double)xr[c] - mean)) * inv_std;
+            float g = gyr[c];
+            gw[c] += g * xhat;
+            if (gb) gb[c] += g;
+            float dxhat = g * w[c];
+            sum1 += (double)dxhat;
+            sum2 += (double)(dxhat * xhat);
+        }
+        float inv_d = 1.0f / (float)dim;
+        for (int32_t c = 0; c < dim; c++) {
+            float xhat = ((float)((double)xr[c] - mean)) * inv_std;
+            float dxhat = gyr[c] * w[c];
+            gxr[c] = inv_std * (dxhat - inv_d * ((float)sum1 + xhat * (float)sum2));
+        }
+    }
+}
+
+static void cpu_l2_norm_last_fwd(int32_t dev_id, const float *x, float *out, int32_t rows, int32_t dim, float eps) {
+    (void)dev_id;
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * dim;
+        float *orow = out + (int64_t)r * dim;
+        double ss = 0.0;
+        for (int32_t c = 0; c < dim; c++) ss += (double)xr[c] * (double)xr[c];
+        float norm = sqrtf((float)ss);
+        float inv = 1.0f / (norm > eps ? norm : eps);
+        for (int32_t c = 0; c < dim; c++) orow[c] = xr[c] * inv;
+    }
+}
+
+static void cpu_l2_norm_last_bwd(int32_t dev_id, const float *x, const float *gy, float *gx, int32_t rows, int32_t dim, float eps) {
+    (void)dev_id;
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * dim;
+        const float *gyr = gy + (int64_t)r * dim;
+        float *gxr = gx + (int64_t)r * dim;
+        double ss = 0.0;
+        for (int32_t c = 0; c < dim; c++) ss += (double)xr[c] * (double)xr[c];
+        float norm = sqrtf((float)ss);
+        if (norm <= eps) {
+            float inv = 1.0f / eps;
+            for (int32_t c = 0; c < dim; c++) gxr[c] = gyr[c] * inv;
+        } else {
+            float inv = 1.0f / norm;
+            float inv3 = inv * inv * inv;
+            double dot = 0.0;
+            for (int32_t c = 0; c < dim; c++) dot += (double)xr[c] * (double)gyr[c];
+            float coeff = (float)dot * inv3;
+            for (int32_t c = 0; c < dim; c++) gxr[c] = gyr[c] * inv - xr[c] * coeff;
+        }
+    }
+}
+
 static void cpu_softmax_fwd(int32_t dev_id, const float *x, float *out, int32_t rows, int32_t cols) {
     (void)dev_id;
     for (int32_t r = 0; r < rows; r++) {
@@ -301,9 +502,32 @@ static void cpu_softmax_bwd(int32_t dev_id, const float *y, const float *gy, flo
     }
 }
 
-static float cpu_cross_entropy_fwd(int32_t dev_id, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab) {
+static void cpu_log_sum_exp_fwd(int32_t dev_id, const float *x, float *out, int32_t rows, int32_t cols) {
+    (void)dev_id;
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * cols;
+        float mx = xr[0];
+        for (int32_t c = 1; c < cols; c++) if (xr[c] > mx) mx = xr[c];
+        double sum = 0.0;
+        for (int32_t c = 0; c < cols; c++) sum += exp((double)(xr[c] - mx));
+        out[r] = (float)((double)mx + log(sum));
+    }
+}
+
+static void cpu_log_sum_exp_bwd(int32_t dev_id, const float *x, const float *lse, const float *gy, float *gx, int32_t rows, int32_t cols) {
+    (void)dev_id;
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (int64_t)r * cols;
+        float *gxr = gx + (int64_t)r * cols;
+        float lr = lse[r], g = gy[r];
+        for (int32_t c = 0; c < cols; c++) gxr[c] = g * expf(xr[c] - lr);
+    }
+}
+
+static float cpu_cross_entropy_fwd(int32_t dev_id, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab, int32_t ignore_idx) {
     (void)dev_id;
     double total_loss = 0.0;
+    int32_t valid = 0;
     for (int32_t r = 0; r < rows; r++) {
         const float *lr = logits + (int64_t)r * vocab;
         float *pr = probs_out + (int64_t)r * vocab;
@@ -314,23 +538,36 @@ static float cpu_cross_entropy_fwd(int32_t dev_id, const float *logits, const in
         float inv = (float)(1.0 / sum);
         for (int32_t c = 0; c < vocab; c++) pr[c] *= inv;
         int32_t tgt = targets[r];
-        if (tgt >= 0 && tgt < vocab) {
+        if (tgt != ignore_idx && tgt >= 0 && tgt < vocab) {
             total_loss -= ((double)(lr[tgt] - mx) - log(sum));
+            valid++;
         }
     }
-    return rows > 0 ? (float)(total_loss / (double)rows) : 0.0f;
+    return valid > 0 ? (float)(total_loss / (double)valid) : 0.0f;
 }
 
-static void cpu_cross_entropy_bwd(int32_t dev_id, const float *probs, const int32_t *targets, float g_loss, float *g_logits, int32_t rows, int32_t vocab) {
+static void cpu_cross_entropy_bwd(int32_t dev_id, const float *probs, const int32_t *targets, float g_loss, float *g_logits, int32_t rows, int32_t vocab, int32_t ignore_idx) {
     (void)dev_id;
-    if (rows <= 0) return;
-    float scale = g_loss / (float)rows;
+    int32_t valid = 0;
+    for (int32_t r = 0; r < rows; r++) {
+        int32_t tgt = targets[r];
+        if (tgt != ignore_idx && tgt >= 0 && tgt < vocab) valid++;
+    }
+    if (valid <= 0) {
+        memset(g_logits, 0, (size_t)((int64_t)rows * vocab) * sizeof(float));
+        return;
+    }
+    float scale = g_loss / (float)valid;
     for (int32_t r = 0; r < rows; r++) {
         const float *pr = probs + (int64_t)r * vocab;
         float *gr = g_logits + (int64_t)r * vocab;
         int32_t tgt = targets[r];
-        for (int32_t c = 0; c < vocab; c++) gr[c] = pr[c] * scale;
-        if (tgt >= 0 && tgt < vocab) gr[tgt] -= scale;
+        if (tgt == ignore_idx || tgt < 0 || tgt >= vocab) {
+            memset(gr, 0, (size_t)vocab * sizeof(float));
+        } else {
+            for (int32_t c = 0; c < vocab; c++) gr[c] = pr[c] * scale;
+            gr[tgt] -= scale;
+        }
     }
 }
 
@@ -484,22 +721,36 @@ const GsTensorBackend gs_backend_cpu = {
     .add = cpu_add,
     .sub = cpu_sub,
     .mul = cpu_mul,
+    .div_ew = cpu_div_ew,
     .scale = cpu_scale,
+    .add_scalar = cpu_add_scalar,
+    .pow_scalar_fwd = cpu_pow_scalar_fwd,
+    .pow_scalar_bwd = cpu_pow_scalar_bwd,
+    .clamp_fwd = cpu_clamp_fwd,
+    .clamp_bwd = cpu_clamp_bwd,
+    .leaky_relu_fwd = cpu_leaky_relu_fwd,
+    .leaky_relu_bwd = cpu_leaky_relu_bwd,
     .axpy = cpu_axpy,
-    .add_row_bias = cpu_add_row_bias,
-    .sum_rows = cpu_sum_rows,
-    .silu_fwd = cpu_silu_fwd,
-    .silu_bwd = cpu_silu_bwd,
-    .gelu_fwd = cpu_gelu_fwd,
-    .gelu_bwd = cpu_gelu_bwd,
-    .relu_fwd = cpu_relu_fwd,
-    .relu_bwd = cpu_relu_bwd,
+    .bcast_binop = cpu_bcast_binop,
+    .bcast_reduce_sum = cpu_bcast_reduce_sum,
+    .unary_fwd = cpu_unary_fwd,
+    .unary_bwd = cpu_unary_bwd,
+    .slice_axis_fwd = cpu_slice_axis_fwd,
+    .slice_axis_bwd = cpu_slice_axis_bwd,
+    .sum_axis = cpu_sum_axis,
+    .max_axis = cpu_max_axis,
     .sum_all = cpu_sum_all,
     .sum_sq = cpu_sum_sq,
     .rms_norm_fwd = cpu_rms_norm_fwd,
     .rms_norm_bwd = cpu_rms_norm_bwd,
+    .layer_norm_fwd = cpu_layer_norm_fwd,
+    .layer_norm_bwd = cpu_layer_norm_bwd,
+    .l2_norm_last_fwd = cpu_l2_norm_last_fwd,
+    .l2_norm_last_bwd = cpu_l2_norm_last_bwd,
     .softmax_fwd = cpu_softmax_fwd,
     .softmax_bwd = cpu_softmax_bwd,
+    .log_sum_exp_fwd = cpu_log_sum_exp_fwd,
+    .log_sum_exp_bwd = cpu_log_sum_exp_bwd,
     .cross_entropy_fwd = cpu_cross_entropy_fwd,
     .cross_entropy_bwd = cpu_cross_entropy_bwd,
     .embedding_fwd = cpu_embedding_fwd,

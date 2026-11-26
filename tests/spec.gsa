@@ -1,27 +1,29 @@
 // End-to-end verification suite for `tensor.gsa` (`tests/spec.gsa`):
-// 1. Analytic vs finite-difference gradient check (Linear + RMSNorm + SiLU + CrossEntropy)
-// 2. Mini Llama-style CausalLM training with AdamW
-// 3. Mini Llama-style CausalLM training with Muon (Newton-Schulz)
-// 4. Pure-Geisha Safetensors + HuggingFace `config.json` roundtrip & key parity
+// 1. Broadcasting arithmetic (+, -, *, /) + finite-difference gradient check
+// 2. Universal ops: unary math, LayerNorm, L2Norm, LogSumExp, CrossEntropyIgnore, slice/chunk/cat/pad/sumAxis
+// 3. Analytic vs finite-difference gradient check (Linear + RMSNorm + SiLU + CrossEntropy)
+// 4. Mini Llama-style CausalLM training with AdamW & Muon
+// 5. Pure-Geisha Safetensors + HuggingFace `config.json` roundtrip & key parity
 
 use std.result.{Result, Ok, Err}
 use std.list.{listLen}
-use std.str.{intToStr, floatToStr}
 use sys.fs.removeFile
 use sys.io.eprintLn
 use sys.proc.exit
 
-use tensor.tensor.{
-    Tensor, Cpu, fromList, fromI32List, getAt, item,
-    silu, rmsNorm, crossEntropy, matmulNT, meanAll, sub, l2NormFloat
+use tensor.backend.Cpu
+use tensor.tensor.{Tensor, fromList, fromI32List, getAt, item, shapeEq}
+use tensor.ops.{
+    add, sub, mul, divT, silu, sigmoid, exp, log, square, clamp,
+    rmsNorm, layerNorm, l2NormLast, logSumExpLast,
+    crossEntropy, crossEntropyIgnore, mseLoss, matmulNT,
+    sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
 }
 use tensor.ad.{Params, valueAndGrad, paramCount}
-use tensor.nn.{
-    LMConfig, CausalLM, rngNew, initCausalLM, causalLMFwd
-}
+use tensor.nn.{LMConfig, CausalLM, rngNew, initCausalLM, causalLMFwd}
 use tensor.optim.{
     defaultAdamW, adamwInit, adamwStep,
-    defaultMuon, muonInit, muonStep, clipGradNorm
+    defaultMuon, muonInit, muonStep, clipGradNorm, cosineLr
 }
 use tensor.safetensors.{
     StateDict, stateDictList, saveSafetensors, loadSafetensors,
@@ -38,7 +40,86 @@ def hasKey(xs: List (String, Tensor), target: String): Bool = match xs {
     Cons((k, _), r) -> if (k == target) true else hasKey(r, target),
 }
 
-// 1. Finite-difference gradient verification
+// 1. Broadcasting arithmetic + backward grad check
+data BcastNet : Params {
+    scaleRow: Tensor, // [3]
+    scaleCol: Tensor, // [2, 1]
+    bias: Tensor,     // [3]
+}
+
+def testBroadcasting(): Result Void String = {
+    let x = fromList([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let sr = fromList([3], [0.5, 1.5, -0.5]);
+    let sc = fromList([2, 1], [2.0, 0.5]);
+    let b = fromList([3], [0.1, -0.2, 0.3]);
+    let net = BcastNet { scaleRow: sr, scaleCol: sc, bias: b };
+    let lossFn = (m: BcastNet) -> {
+        let y = (x * m.scaleCol + m.bias) * m.scaleRow;
+        meanAll(square(y))
+    };
+    let (_, grads) = valueAndGrad(net, lossFn);
+    let eps = 1.0e-3;
+    let srP = fromList([3], [0.5 + eps, 1.5, -0.5]);
+    let srM = fromList([3], [0.5 - eps, 1.5, -0.5]);
+    let fdSr0 = (item(lossFn(BcastNet { scaleRow: srP, scaleCol: sc, bias: b })) - item(lossFn(BcastNet { scaleRow: srM, scaleCol: sc, bias: b }))) / (2.0 * eps);
+
+    let scP = fromList([2, 1], [2.0, 0.5 + eps]);
+    let scM = fromList([2, 1], [2.0, 0.5 - eps]);
+    let fdSc1 = (item(lossFn(BcastNet { scaleRow: sr, scaleCol: scP, bias: b })) - item(lossFn(BcastNet { scaleRow: sr, scaleCol: scM, bias: b }))) / (2.0 * eps);
+
+    let _ = assertTrue("bcast_grad_row", absF(getAt(grads.scaleRow, 0) - fdSr0) < 2.0e-2)?;
+    let _ = assertTrue("bcast_grad_col", absF(getAt(grads.scaleCol, 1) - fdSc1) < 2.0e-2)?;
+
+    // Division broadcast: [2, 3] / [2, 1]
+    let d = x / sc;
+    let _ = assertTrue("bcast_div_val", absF(getAt(d, 0) - 0.5) < 1.0e-5 && absF(getAt(d, 3) - 8.0) < 1.0e-5)?;
+    Ok(())
+}
+
+// 2. Universal ops: axis slice/chunk/cat/pad, LayerNorm, L2Norm, LogSumExp, CrossEntropyIgnore
+data OpsNet : Params {
+    x: Tensor,
+    w: Tensor,
+    b: Tensor,
+}
+
+def testUniversalOps(): Result Void String = {
+    let x = fromList([2, 4], [0.5, -0.3, 0.8, 0.2, -0.4, 0.6, -0.1, 0.9]);
+    let w = fromList([4], [1.1, 0.9, 1.05, 0.95]);
+    let b = fromList([4], [0.1, -0.1, 0.05, -0.05]);
+    let net = OpsNet { x: x, w: w, b: b };
+
+    let lossFn = (m: OpsNet) -> {
+        let ln = layerNorm(m.x, m.w, m.b, 1.0e-5);
+        let parts = chunkAxis(ln, -1, 2);
+        let recon = catAxis(parts, -1);
+        let normd = l2NormLast(sigmoid(recon), 1.0e-4);
+        let lse = logSumExpLast(normd);
+        meanAll(square(lse))
+    };
+    let (_, grads) = valueAndGrad(net, lossFn);
+    let eps = 1.0e-3;
+    let xP = fromList([2, 4], [0.5 + eps, -0.3, 0.8, 0.2, -0.4, 0.6, -0.1, 0.9]);
+    let xM = fromList([2, 4], [0.5 - eps, -0.3, 0.8, 0.2, -0.4, 0.6, -0.1, 0.9]);
+    let fdX0 = (item(lossFn(OpsNet { x: xP, w: w, b: b })) - item(lossFn(OpsNet { x: xM, w: w, b: b }))) / (2.0 * eps);
+    let _ = assertTrue("universal_ops_grad", absF(getAt(grads.x, 0) - fdX0) < 2.0e-2)?;
+
+    // padAxis + sliceAxis + sumAxis + crossEntropyIgnore
+    let padded = padAxis(x, 0, 1, 0, 0.0);
+    let _ = assertTrue("pad_shape", shapeEq(padded.shape, [3, 4]))?;
+    let sliced = sliceAxis(padded, 0, 1, 2);
+    let _ = assertTrue("slice_roundtrip", l2NormFloat(sliced - x) < 1.0e-6)?;
+    let sAx = sumAxis(x, 1, false);
+    let _ = assertTrue("sum_axis_val", shapeEq(sAx.shape, [2]) && absF(getAt(sAx, 0) - 1.2) < 1.0e-5)?;
+    let tgtIgn = fromI32List([2], [0, 2]);
+    let ceIgn = crossEntropyIgnore(x, tgtIgn, 0);
+    let _ = assertTrue("ce_ignore_positive", item(ceIgn) > 0.0)?;
+    let lrMid = cosineLr(5, 2, 10, 1.0e-3, 1.0e-4);
+    let _ = assertTrue("cosine_lr_bounds", lrMid > 1.0e-4 && lrMid < 1.0e-3)?;
+    Ok(())
+}
+
+// 3. Finite-difference gradient check on Linear + RMSNorm + SiLU + CrossEntropy
 data TinyNet : Params {
     w: Tensor,
     gamma: Tensor,
@@ -56,26 +137,19 @@ def testGradCheck(): Result Void String = {
         crossEntropy(logits, targets)
     };
     let (_, grads) = valueAndGrad(net, lossFn);
-    let analyticW0 = getAt(grads.w, 0);
-    let analyticG1 = getAt(grads.gamma, 1);
-
-    // Finite-difference on w[0]
     let eps = 1.0e-3;
-    let wPlus = fromList([3, 4], [0.2 + eps, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, -0.3, 0.3, 0.4, -0.2, 0.1]);
-    let wMinus = fromList([3, 4], [0.2 - eps, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, -0.3, 0.3, 0.4, -0.2, 0.1]);
-    let fdW0 = (item(lossFn(TinyNet { w: wPlus, gamma: g })) - item(lossFn(TinyNet { w: wMinus, gamma: g }))) / (2.0 * eps);
-
-    // Finite-difference on gamma[1]
-    let gPlus = fromList([4], [1.1, 0.9 + eps, 1.05, 0.95]);
-    let gMinus = fromList([4], [1.1, 0.9 - eps, 1.05, 0.95]);
-    let fdG1 = (item(lossFn(TinyNet { w: w, gamma: gPlus })) - item(lossFn(TinyNet { w: w, gamma: gMinus }))) / (2.0 * eps);
-
-    let _ = assertTrue("grad_w0_match", absF(analyticW0 - fdW0) < 1.0e-2)?;
-    let _ = assertTrue("grad_gamma1_match", absF(analyticG1 - fdG1) < 1.0e-2)?;
+    let wP = fromList([3, 4], [0.2 + eps, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, -0.3, 0.3, 0.4, -0.2, 0.1]);
+    let wM = fromList([3, 4], [0.2 - eps, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, -0.3, 0.3, 0.4, -0.2, 0.1]);
+    let fdW0 = (item(lossFn(TinyNet { w: wP, gamma: g })) - item(lossFn(TinyNet { w: wM, gamma: g }))) / (2.0 * eps);
+    let gP = fromList([4], [1.1, 0.9 + eps, 1.05, 0.95]);
+    let gM = fromList([4], [1.1, 0.9 - eps, 1.05, 0.95]);
+    let fdG1 = (item(lossFn(TinyNet { w: w, gamma: gP })) - item(lossFn(TinyNet { w: w, gamma: gM }))) / (2.0 * eps);
+    let _ = assertTrue("grad_w0_match", absF(getAt(grads.w, 0) - fdW0) < 1.0e-2)?;
+    let _ = assertTrue("grad_gamma1_match", absF(getAt(grads.gamma, 1) - fdG1) < 1.0e-2)?;
     Ok(())
 }
 
-// 2 & 3. Mini CausalLM training with AdamW and Muon
+// 4. Mini CausalLM training with AdamW and Muon
 def makeMiniCfg(): LMConfig = LMConfig {
     vocabSize: 16,
     hiddenSize: 32,
@@ -88,8 +162,7 @@ def makeMiniCfg(): LMConfig = LMConfig {
 }
 
 def testTrainAdamW(): Result CausalLM String = {
-    let cfg = makeMiniCfg();
-    let (lm0, _) = initCausalLM(cfg, rngNew(42));
+    let (lm0, _) = initCausalLM(makeMiniCfg(), rngNew(42));
     let _ = assertTrue("param_count_positive", paramCount(lm0) > 10000)?;
     let inp = fromI32List([1, 6], [1, 2, 3, 4, 5, 6]);
     let tgt = fromI32List([1, 6], [2, 3, 4, 5, 6, 7]);
@@ -103,8 +176,7 @@ def testTrainAdamW(): Result CausalLM String = {
         let (loss, grads) = valueAndGrad(cellGet(lmCell), (m) -> crossEntropy(causalLMFwd(m, inp), tgt));
         if (cellGet(step) == 0) cellSet(firstLoss, loss) else ();
         cellSet(lastLoss, loss);
-        let clipped = clipGradNorm(grads, 1.0);
-        let (lmNext, stNext) = adamwStep(optCfg, cellGet(stCell), cellGet(lmCell), clipped);
+        let (lmNext, stNext) = adamwStep(optCfg, cellGet(stCell), cellGet(lmCell), clipGradNorm(grads, 1.0));
         cellSet(lmCell, lmNext);
         cellSet(stCell, stNext);
         cellSet(step, cellGet(step) + 1)
@@ -114,8 +186,7 @@ def testTrainAdamW(): Result CausalLM String = {
 }
 
 def testTrainMuon(): Result Void String = {
-    let cfg = makeMiniCfg();
-    let (lm0, _) = initCausalLM(cfg, rngNew(99));
+    let (lm0, _) = initCausalLM(makeMiniCfg(), rngNew(99));
     let inp = fromI32List([1, 6], [1, 3, 5, 7, 9, 11]);
     let tgt = fromI32List([1, 6], [3, 5, 7, 9, 11, 13]);
     let optCfg = defaultMuon(0.03);
@@ -137,7 +208,7 @@ def testTrainMuon(): Result Void String = {
     Ok(())
 }
 
-// 4. Safetensors + HF config.json roundtrip & key parity
+// 5. Safetensors + HF config.json roundtrip & key parity
 def testSafetensorsRoundtrip(trained: CausalLM): Result Void String = {
     let sd = stateDictList(trained);
     let _ = assertTrue("hf_key_embed", hasKey(sd, "model.embed_tokens.weight"))?;
@@ -151,22 +222,14 @@ def testSafetensorsRoundtrip(trained: CausalLM): Result Void String = {
     let nSaved = saveSafetensors(stPath, trained)?;
     let _ = assertTrue("saved_tensor_count", nSaved == listLen(sd))?;
     let _ = saveHfLlamaConfig(cfgPath, HfLlamaConfig {
-        vocabSize: 16,
-        hiddenSize: 32,
-        intermediateSize: 64,
-        numHiddenLayers: 2,
-        numAttentionHeads: 4,
-        rmsNormEps: 1.0e-5,
-        ropeTheta: 10000.0,
+        vocabSize: 16, hiddenSize: 32, intermediateSize: 64,
+        numHiddenLayers: 2, numAttentionHeads: 4, rmsNormEps: 1.0e-5, ropeTheta: 10000.0,
     })?;
 
-    // Reload into a freshly initialized model with different seed
     let (fresh, _) = initCausalLM(makeMiniCfg(), rngNew(777));
     let reloaded = loadSafetensors(stPath, fresh)?;
     let inp = fromI32List([1, 6], [1, 2, 3, 4, 5, 6]);
-    let out1 = causalLMFwd(trained, inp);
-    let out2 = causalLMFwd(reloaded, inp);
-    let diff = l2NormFloat(sub(out1, out2));
+    let diff = l2NormFloat(causalLMFwd(trained, inp) - causalLMFwd(reloaded, inp));
     let _ = removeFile(stPath);
     let _ = removeFile(cfgPath);
     let _ = assertTrue("safetensors_logits_exact", diff < 1.0e-5)?;
@@ -174,6 +237,8 @@ def testSafetensorsRoundtrip(trained: CausalLM): Result Void String = {
 }
 
 def runAll(): Result Void String = {
+    let _ = testBroadcasting()?;
+    let _ = testUniversalOps()?;
     let _ = testGradCheck()?;
     let trained = testTrainAdamW()?;
     let _ = testTrainMuon()?;
@@ -182,7 +247,7 @@ def runAll(): Result Void String = {
 }
 
 def main(): Void = match runAll() {
-    Ok(_) -> printLn("PASS [tensor.gsa]: gradcheck + AdamW + Muon + HF safetensors roundtrip"),
+    Ok(_) -> printLn("PASS [tensor.gsa]: broadcast + universal ops + gradcheck + AdamW + Muon + HF safetensors"),
     Err(msg) -> {
         eprintLn(msg);
         exit(1)

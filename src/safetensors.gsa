@@ -11,10 +11,13 @@ use std.buf.{bufNew, bufPushByte, bufToString}
 use std.codec.{Value, VObj, VArr, VStr, VInt, object, array, strVal, i64Val, (:=)}
 use std.json.{parse, stringify, stringifyPretty}
 use sys.fs.writeFile
-use tensor.tensor.{
-    Tensor, Device, Cpu, allocTensorOn, toDevice, tensorDevice,
+use tensor.backend.{
+    Device, Cpu,
     c_fopen_wb, c_fopen_rb, c_fclose, c_fwrite_u64_le, c_fread_u64_le,
     c_fwrite_bytes, c_fread_bytes, c_fwrite_cstr
+}
+use tensor.tensor.{
+    Tensor, allocTensorOn, toDevice, tensorDevice
 }
 
 // ============================================================================

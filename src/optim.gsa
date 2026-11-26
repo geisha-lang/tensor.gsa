@@ -2,10 +2,8 @@
 // orthogonalization for 2D matrices + AdamW for 1D/embeddings), and grad clipping.
 
 use std.list.listLen
-use tensor.tensor.{
-    Tensor, zerosLike, dimAt, add, mul, scale, matmul, transpose2d,
-    l2NormFloat, adamwStepRaw, detach
-}
+use tensor.tensor.{Tensor, zerosLike, dimAt, adamwStepRaw, detach}
+use tensor.ops.{add, mul, scale, matmul, transpose2d, l2NormFloat}
 use tensor.ad.{Params, mapParams, zipParams, gradNorm}
 
 // ============================================================================
@@ -19,6 +17,24 @@ pub def clipGradNorm(grads, maxNorm): forall m. (Params m) => (m, Float) -> m = 
         mapParams((g) -> scale(detach(g), s), grads)
     } else grads
 }
+
+pub def cosineLr(step: Int, warmupSteps: Int, totalSteps: Int, maxLr: Float, minLr: Float): Float =
+    if (step < warmupSteps && warmupSteps > 0) {
+        maxLr * intToFloat(step + 1) / intToFloat(warmupSteps)
+    } else if (step >= totalSteps) {
+        minLr
+    } else {
+        let denom = intToFloat(if (totalSteps > warmupSteps) totalSteps - warmupSteps else 1);
+        let progress = intToFloat(step - warmupSteps) / denom;
+        let cs = f32ToFloat(mathCosF32(floatToF32(3.141592653589793 * progress)));
+        minLr + 0.5 * (maxLr - minLr) * (1.0 + cs)
+    }
+
+pub def sgdStep(lr, weightDecay, model, grads): forall m. (Params m) => (Float, Float, m, m) -> m =
+    zipParams((p, g) -> {
+        let decayed = scale(detach(p), 1.0 - lr * weightDecay);
+        add(decayed, scale(detach(g), -lr))
+    }, model, grads)
 
 // ============================================================================
 // AdamW (pure functional `(cfg, state, model, grads) -> (newModel, newState)`)

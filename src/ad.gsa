@@ -6,8 +6,9 @@ use std.list.{listMap, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet}
 use tensor.tensor.{
     Tensor, beginTape, endTape, stampLeaf, runBackward,
-    zerosLike, item, sumSqFloat
+    zerosLike, item
 }
+use tensor.ops.sumSqFloat
 
 // ============================================================================
 // `Params` Concept (auto-derivable via `data T : Params { ... }`)

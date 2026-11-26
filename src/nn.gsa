@@ -3,11 +3,13 @@
 
 use std.option.{Option, Some, None}
 use std.list.{listRev}
+use tensor.backend.{Device, Cpu}
 use tensor.tensor.{
-    Tensor, IntTensor, Device, Cpu,
-    zerosOn, onesOn, randnOn, dimAt,
-    add, mul, scale, addRowBias, matmulNT, bgemm, bgemmNT,
-    reshape, transpose0213, silu, rmsNorm, softmax, embedding, rope, causalMask
+    Tensor, IntTensor, zerosOn, onesOn, randnOn, dimAt
+}
+use tensor.ops.{
+    add, mul, scale, matmulNT, bgemm, bgemmNT,
+    reshape, transpose0213, silu, rmsNorm, layerNorm, softmax, embedding, rope, causalMask
 }
 use tensor.ad.Params
 use tensor.safetensors.StateDict
@@ -42,6 +44,12 @@ pub data Embedding : Params, StateDict {
 
 pub data RMSNorm : Params, StateDict {
     weight: Tensor,
+    eps: Float,
+}
+
+pub data LayerNorm : Params, StateDict {
+    weight: Tensor,
+    bias: Tensor,
     eps: Float,
 }
 
@@ -110,6 +118,9 @@ pub def initEmbedding(vocab: Int, dim: Int, dev: Device, r: Rng): (Embedding, Rn
 pub def initRMSNorm(dim: Int, eps: Float, dev: Device): RMSNorm =
     RMSNorm { weight: onesOn([dim], dev), eps: eps }
 
+pub def initLayerNorm(dim: Int, eps: Float, dev: Device): LayerNorm =
+    LayerNorm { weight: onesOn([dim], dev), bias: zerosOn([dim], dev), eps: eps }
+
 pub def initSwiGLU(dim: Int, hiddenDim: Int, dev: Device, r: Rng): (SwiGLU, Rng) = {
     let (gp, r1) = initLinear(dim, hiddenDim, false, dev, r);
     let (up, r2) = initLinear(dim, hiddenDim, false, dev, r1);
@@ -166,7 +177,7 @@ pub def initCausalLM(cfg: LMConfig, r: Rng): (CausalLM, Rng) = {
 pub def linearFwd(l: Linear, x: Tensor): Tensor = {
     let y = matmulNT(x, l.weight);
     match l.bias {
-        Some(b) -> addRowBias(y, b),
+        Some(b) -> y + b,
         None -> y,
     }
 }
@@ -176,6 +187,9 @@ pub def embeddingFwd(e: Embedding, ids: IntTensor): Tensor =
 
 pub def rmsNormFwd(n: RMSNorm, x: Tensor): Tensor =
     rmsNorm(x, n.weight, n.eps)
+
+pub def layerNormFwd(n: LayerNorm, x: Tensor): Tensor =
+    layerNorm(x, n.weight, n.bias, n.eps)
 
 pub def swigluFwd(m: SwiGLU, x: Tensor): Tensor = {
     let gate = silu(linearFwd(m.gate_proj, x));

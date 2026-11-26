@@ -1,0 +1,97 @@
+// Multi-backend `Device` ADT and native C/CUDA/Accelerate FFI bindings (`tensor.backend`).
+
+use std.generic
+
+pub data Device : Eq {
+    Cpu,
+    Cuda(Int),
+    Metal(Int),
+}
+
+pub def devKind(d: Device): Int = match d {
+    Cpu -> 0,
+    Cuda(_) -> 1,
+    Metal(_) -> 2,
+}
+
+pub def devId(d: Device): Int = match d {
+    Cpu -> 0,
+    Cuda(i) -> i,
+    Metal(i) -> i,
+}
+
+// ============================================================================
+// Native Multi-Backend FFI (`extern noalloc` + ForeignPtr -> ScopedPtr auto-borrow)
+// ============================================================================
+
+pub extern noalloc "gs_t_cuda_device_count" def c_cuda_device_count(): Int
+pub extern noalloc "gs_t_alloc" def c_alloc(dk: Int, did: Int, nbytes: Int64): Ptr
+pub extern noalloc "gs_t_free_fn" def c_free_fn(dk: Int): Ptr
+pub extern noalloc "gs_t_memcpy_dev" def c_memcpy_dev(dst: ScopedPtr, ddk: Int, ddid: Int, src: ScopedPtr, sdk: Int, sdid: Int, nbytes: Int64): Void
+
+pub extern noalloc "gs_t_sgemm" def c_sgemm(dk: Int, did: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
+pub extern noalloc "gs_t_bgemm" def c_bgemm(dk: Int, did: Int, batch: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
+
+pub extern noalloc "gs_t_fill" def c_fill(dk: Int, did: Int, dst: ScopedPtr, n: Int64, val: Float32): Void
+pub extern noalloc "gs_t_copy" def c_copy(dk: Int, did: Int, dst: ScopedPtr, src: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_add" def c_add(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_sub" def c_sub(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_mul" def c_mul(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_div_ew" def c_div_ew(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_scale" def c_scale(dk: Int, did: Int, a: ScopedPtr, s: Float32, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_add_scalar" def c_add_scalar(dk: Int, did: Int, a: ScopedPtr, s: Float32, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_pow_scalar_fwd" def c_pow_scalar_fwd(dk: Int, did: Int, a: ScopedPtr, p: Float32, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_pow_scalar_bwd" def c_pow_scalar_bwd(dk: Int, did: Int, a: ScopedPtr, gy: ScopedPtr, p: Float32, gx: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_clamp_fwd" def c_clamp_fwd(dk: Int, did: Int, a: ScopedPtr, lo: Float32, hi: Float32, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_clamp_bwd" def c_clamp_bwd(dk: Int, did: Int, a: ScopedPtr, gy: ScopedPtr, lo: Float32, hi: Float32, gx: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_leaky_relu_fwd" def c_leaky_relu_fwd(dk: Int, did: Int, a: ScopedPtr, slope: Float32, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_leaky_relu_bwd" def c_leaky_relu_bwd(dk: Int, did: Int, a: ScopedPtr, gy: ScopedPtr, slope: Float32, gx: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_axpy" def c_axpy(dk: Int, did: Int, alpha: Float32, x: ScopedPtr, y: ScopedPtr, n: Int64): Void
+
+pub extern noalloc "gs_t_bcast_binop" def c_bcast_binop(dk: Int, did: Int, op: Int, ndim: Int, total: Int64, out_shape: ScopedPtr, a_strides: ScopedPtr, b_strides: ScopedPtr, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr): Void
+pub extern noalloc "gs_t_bcast_reduce_sum" def c_bcast_reduce_sum(dk: Int, did: Int, ndim: Int, src_total: Int64, dst_total: Int64, src_shape: ScopedPtr, dst_strides: ScopedPtr, src: ScopedPtr, dst: ScopedPtr): Void
+
+pub extern noalloc "gs_t_unary_fwd" def c_unary_fwd(dk: Int, did: Int, op: Int, x: ScopedPtr, out: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_unary_bwd" def c_unary_bwd(dk: Int, did: Int, op: Int, x: ScopedPtr, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, n: Int64): Void
+
+pub extern noalloc "gs_t_slice_axis_fwd" def c_slice_axis_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, outer: Int, in_dim: Int, inner: Int, start: Int, len: Int): Void
+pub extern noalloc "gs_t_slice_axis_bwd" def c_slice_axis_bwd(dk: Int, did: Int, gy: ScopedPtr, gx: ScopedPtr, outer: Int, in_dim: Int, inner: Int, start: Int, len: Int): Void
+pub extern noalloc "gs_t_sum_axis" def c_sum_axis(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
+pub extern noalloc "gs_t_max_axis" def c_max_axis(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
+pub extern noalloc "gs_t_sum_all" def c_sum_all(dk: Int, did: Int, x: ScopedPtr, n: Int64): Float32
+pub extern noalloc "gs_t_sum_sq" def c_sum_sq(dk: Int, did: Int, x: ScopedPtr, n: Int64): Float32
+
+pub extern noalloc "gs_t_rms_norm_fwd" def c_rms_norm_fwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, out: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_rms_norm_bwd" def c_rms_norm_bwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, gw: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_layer_norm_fwd" def c_layer_norm_fwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, b: ScopedPtr, out: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_layer_norm_bwd" def c_layer_norm_bwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, gw: ScopedPtr, gb: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_l2_norm_last_fwd" def c_l2_norm_last_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_l2_norm_last_bwd" def c_l2_norm_last_bwd(dk: Int, did: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+pub extern noalloc "gs_t_softmax_fwd" def c_softmax_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+pub extern noalloc "gs_t_softmax_bwd" def c_softmax_bwd(dk: Int, did: Int, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
+pub extern noalloc "gs_t_log_sum_exp_fwd" def c_log_sum_exp_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+pub extern noalloc "gs_t_log_sum_exp_bwd" def c_log_sum_exp_bwd(dk: Int, did: Int, x: ScopedPtr, lse: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
+pub extern noalloc "gs_t_cross_entropy_fwd" def c_ce_fwd(dk: Int, did: Int, logits: ScopedPtr, targets: ScopedPtr, probs: ScopedPtr, rows: Int, vocab: Int, ignore_idx: Int): Float32
+pub extern noalloc "gs_t_cross_entropy_bwd" def c_ce_bwd(dk: Int, did: Int, probs: ScopedPtr, targets: ScopedPtr, g_loss: Float32, g_logits: ScopedPtr, rows: Int, vocab: Int, ignore_idx: Int): Void
+pub extern noalloc "gs_t_embedding_fwd" def c_emb_fwd(dk: Int, did: Int, table: ScopedPtr, ids: ScopedPtr, out: ScopedPtr, n_ids: Int, dim: Int): Void
+pub extern noalloc "gs_t_embedding_bwd" def c_emb_bwd(dk: Int, did: Int, ids: ScopedPtr, gy: ScopedPtr, g_table: ScopedPtr, n_ids: Int, vocab: Int, dim: Int): Void
+pub extern noalloc "gs_t_rope_fwd" def c_rope_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, theta: Float32): Void
+pub extern noalloc "gs_t_rope_bwd" def c_rope_bwd(dk: Int, did: Int, gy: ScopedPtr, gx: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, theta: Float32): Void
+pub extern noalloc "gs_t_transpose_2d" def c_transpose_2d(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+pub extern noalloc "gs_t_transpose_0213" def c_transpose_0213(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void
+pub extern noalloc "gs_t_causal_mask_add" def c_causal_mask_add(dk: Int, did: Int, scores: ScopedPtr, bh: Int, seq: Int): Void
+pub extern noalloc "gs_t_randn" def c_randn(dk: Int, did: Int, dst: ScopedPtr, n: Int64, seed: Int64, std: Float32): Void
+pub extern noalloc "gs_t_adamw_step" def c_adamw_step(dk: Int, did: Int, p: ScopedPtr, g: ScopedPtr, m: ScopedPtr, v: ScopedPtr, p_out: ScopedPtr, m_out: ScopedPtr, v_out: ScopedPtr, n: Int64, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32): Void
+
+pub extern "gs_t_fopen_wb" def c_fopen_wb(path: String): Ptr
+pub extern "gs_t_fopen_rb" def c_fopen_rb(path: String): Ptr
+pub extern "gs_t_fclose" def c_fclose(fp: Ptr): Int
+pub extern "gs_t_fwrite_u64_le" def c_fwrite_u64_le(fp: Ptr, v: Int64): Int64
+pub extern "gs_t_fread_u64_le" def c_fread_u64_le(fp: Ptr): Int64
+pub extern "gs_t_fwrite_bytes" def c_fwrite_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
+pub extern "gs_t_fread_bytes" def c_fread_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
+pub extern "gs_t_fseek_set" def c_fseek_set(fp: Ptr, off: Int64): Int
+pub extern "gs_t_fwrite_cstr" def c_fwrite_cstr(fp: Ptr, s: String, n: Int64): Int64
+
+pub def cudaDeviceCount(): Int = c_cuda_device_count()
+pub def autoDevice(): Device = if (c_cuda_device_count() > 0) Cuda(0) else Cpu
