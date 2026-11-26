@@ -60,3 +60,6 @@ WEAK void gs_cu_t0213(int32_t d, const float *x, float *o, int32_t d0, int32_t d
 WEAK void gs_cu_causal(int32_t d, float *s, int32_t bh, int32_t seq) { (void)d;(void)s;(void)bh;(void)seq; }
 WEAK void gs_cu_randn(int32_t d, float *dst, int64_t n, int64_t seed, float std) { (void)d;(void)dst;(void)n;(void)seed;(void)std; }
 WEAK void gs_cu_adamw(int32_t d, const float *p, const float *g, const float *m, const float *v, float *po, float *mo, float *vo, int64_t n, float lr, float b1, float b2, float eps, float wd, float bc1, float bc2) { (void)d;(void)p;(void)g;(void)m;(void)v;(void)po;(void)mo;(void)vo;(void)n;(void)lr;(void)b1;(void)b2;(void)eps;(void)wd;(void)bc1;(void)bc2; }
+WEAK void gs_cu_adamw_batch_reset(void) {}
+WEAK void gs_cu_adamw_batch_push(const float *p, const float *g, const float *m, const float *v, float *po, float *mo, float *vo, int64_t n) { (void)p;(void)g;(void)m;(void)v;(void)po;(void)mo;(void)vo;(void)n; }
+WEAK void gs_cu_adamw_batch_run(int32_t d, float lr, float b1, float b2, float eps, float wd, float bc1, float bc2) { (void)d;(void)lr;(void)b1;(void)b2;(void)eps;(void)wd;(void)bc1;(void)bc2; }

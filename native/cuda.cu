@@ -3,12 +3,29 @@
 
 #ifdef GS_TENSOR_CUDA
 
-#include "backend.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+#define GS_BOP_ADD 0
+#define GS_BOP_SUB 1
+#define GS_BOP_MUL 2
+#define GS_BOP_DIV 3
+
+#define GS_UOP_EXP     0
+#define GS_UOP_LOG     1
+#define GS_UOP_SQRT    2
+#define GS_UOP_RSQRT   3
+#define GS_UOP_ABS     4
+#define GS_UOP_SQUARE  5
+#define GS_UOP_TANH    6
+#define GS_UOP_SIGMOID 7
+#define GS_UOP_ROUND   8
+#define GS_UOP_SILU    9
+#define GS_UOP_GELU    10
+#define GS_UOP_RELU    11
 
 static cublasHandle_t g_cublas = NULL;
 
@@ -520,6 +537,28 @@ __global__ void k_adamw(
     }
 }
 
+__global__ void k_adamw_multi(
+    int32_t count,
+    const float *const *ps, const float *const *gs,
+    const float *const *ms, const float *const *vs,
+    float *const *pos, float *const *mos, float *const *vos,
+    const int64_t *numels,
+    float lr, float b1, float b2, float eps, float wd, float bc1, float bc2
+) {
+    int32_t t = blockIdx.y;
+    if (t >= count) return;
+    int64_t n = numels[t];
+    const float *p = ps[t], *g = gs[t], *m = ms[t], *v = vs[t];
+    float *po = pos[t], *mo = mos[t], *vo = vos[t];
+    for (int64_t i = blockIdx.x * 256LL + threadIdx.x; i < n; i += (int64_t)gridDim.x * 256LL) {
+        float gi = g[i];
+        float mi = b1 * m[i] + (1.0f - b1) * gi;
+        float vi = b2 * v[i] + (1.0f - b2) * gi * gi;
+        mo[i] = mi; vo[i] = vi;
+        po[i] = p[i] * (1.0f - lr * wd) - lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps));
+    }
+}
+
 // ============================================================================
 // Exported C ABI Wrappers for `src/cuda.gsa`
 // ============================================================================
@@ -796,6 +835,127 @@ void gs_cu_adamw(
 ) {
     cudaSetDevice(d);
     if (n > 0) k_adamw<<<grid1d(n), 256>>>(p, g, m, v, po, mo, vo, n, lr, b1, b2, eps, wd, bc1, bc2);
+}
+
+static void *g_adamw_meta_buf = NULL;
+static size_t g_adamw_meta_cap = 0;
+
+typedef struct {
+    const float *p, *g, *m, *v;
+    float *po, *mo, *vo;
+    int64_t n;
+} AdamwItem;
+
+static AdamwItem *g_adamw_items = NULL;
+static int32_t g_adamw_count = 0;
+static int32_t g_adamw_cap = 0;
+
+void gs_cu_adamw_batch_reset(void) {
+    g_adamw_count = 0;
+}
+
+void gs_cu_adamw_batch_push(
+    const float *p, const float *g, const float *m, const float *v,
+    float *po, float *mo, float *vo, int64_t n
+) {
+    if (n <= 0) return;
+    if (g_adamw_count >= g_adamw_cap) {
+        int32_t new_cap = g_adamw_cap > 0 ? g_adamw_cap * 2 : 128;
+        AdamwItem *nb = (AdamwItem *)realloc(g_adamw_items, (size_t)new_cap * sizeof(AdamwItem));
+        if (!nb) return;
+        g_adamw_items = nb;
+        g_adamw_cap = new_cap;
+    }
+    AdamwItem *it = &g_adamw_items[g_adamw_count++];
+    it->p = p; it->g = g; it->m = m; it->v = v;
+    it->po = po; it->mo = mo; it->vo = vo; it->n = n;
+}
+
+void gs_cu_adamw_batch_run(
+    int32_t d, float lr, float b1, float b2, float eps, float wd, float bc1, float bc2
+) {
+    int32_t count = g_adamw_count;
+    g_adamw_count = 0;
+    if (count <= 0) return;
+    cudaSetDevice(d);
+    if (count == 1) {
+        AdamwItem *it = &g_adamw_items[0];
+        k_adamw<<<grid1d(it->n), 256>>>(it->p, it->g, it->m, it->v, it->po, it->mo, it->vo, it->n, lr, b1, b2, eps, wd, bc1, bc2);
+        return;
+    }
+    int64_t max_n = 0;
+    for (int32_t i = 0; i < count; i++) {
+        if (g_adamw_items[i].n > max_n) max_n = g_adamw_items[i].n;
+    }
+    if (max_n <= 0) return;
+    size_t chunk = (size_t)count * sizeof(void *);
+    size_t need = 8 * chunk;
+    void *host_pack = malloc(need);
+    if (!host_pack) {
+        for (int32_t i = 0; i < count; i++) {
+            AdamwItem *it = &g_adamw_items[i];
+            k_adamw<<<grid1d(it->n), 256>>>(it->p, it->g, it->m, it->v, it->po, it->mo, it->vo, it->n, lr, b1, b2, eps, wd, bc1, bc2);
+        }
+        return;
+    }
+    if (need > g_adamw_meta_cap) {
+        if (g_adamw_meta_buf) cudaFree(g_adamw_meta_buf);
+        if (cudaMalloc(&g_adamw_meta_buf, need) != cudaSuccess) {
+            g_adamw_meta_buf = NULL;
+            g_adamw_meta_cap = 0;
+            free(host_pack);
+            for (int32_t i = 0; i < count; i++) {
+                AdamwItem *it = &g_adamw_items[i];
+                k_adamw<<<grid1d(it->n), 256>>>(it->p, it->g, it->m, it->v, it->po, it->mo, it->vo, it->n, lr, b1, b2, eps, wd, bc1, bc2);
+            }
+            return;
+        }
+        g_adamw_meta_cap = need;
+    }
+    char *hb = (char *)host_pack;
+    const float **hps = (const float **)(hb + 0 * chunk);
+    const float **hgs = (const float **)(hb + 1 * chunk);
+    const float **hms = (const float **)(hb + 2 * chunk);
+    const float **hvs = (const float **)(hb + 3 * chunk);
+    float **hpos = (float **)(hb + 4 * chunk);
+    float **hmos = (float **)(hb + 5 * chunk);
+    float **hvos = (float **)(hb + 6 * chunk);
+    int64_t *hnum = (int64_t *)(hb + 7 * chunk);
+    for (int32_t i = 0; i < count; i++) {
+        hps[i] = g_adamw_items[i].p;
+        hgs[i] = g_adamw_items[i].g;
+        hms[i] = g_adamw_items[i].m;
+        hvs[i] = g_adamw_items[i].v;
+        hpos[i] = g_adamw_items[i].po;
+        hmos[i] = g_adamw_items[i].mo;
+        hvos[i] = g_adamw_items[i].vo;
+        hnum[i] = g_adamw_items[i].n;
+    }
+    cudaMemcpy(g_adamw_meta_buf, host_pack, need, cudaMemcpyHostToDevice);
+    free(host_pack);
+    char *db = (char *)g_adamw_meta_buf;
+    const float **d_ps = (const float **)(db + 0 * chunk);
+    const float **d_gs = (const float **)(db + 1 * chunk);
+    const float **d_ms = (const float **)(db + 2 * chunk);
+    const float **d_vs = (const float **)(db + 3 * chunk);
+    float **d_pos = (float **)(db + 4 * chunk);
+    float **d_mos = (float **)(db + 5 * chunk);
+    float **d_vos = (float **)(db + 6 * chunk);
+    int64_t *d_numels = (int64_t *)(db + 7 * chunk);
+    int bx = grid1d(max_n);
+    if (bx > 4096) bx = 4096;
+    int32_t off = 0;
+    while (off < count) {
+        int32_t batch = count - off;
+        if (batch > 65535) batch = 65535;
+        dim3 grid((unsigned int)bx, (unsigned int)batch);
+        k_adamw_multi<<<grid, 256>>>(
+            batch, d_ps + off, d_gs + off, d_ms + off, d_vs + off,
+            d_pos + off, d_mos + off, d_vos + off, d_numels + off,
+            lr, b1, b2, eps, wd, bc1, bc2
+        );
+        off += batch;
+    }
 }
 
 } // extern "C"

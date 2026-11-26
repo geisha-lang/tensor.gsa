@@ -8,7 +8,7 @@ use tensor.backend.{devId}
 use tensor.tensor.{Tensor, zerosLike, allocTensorOn, dimAt, adamwStepRaw, detach, isMetal, isCuda}
 use tensor.cpu.cpuAdamwStep
 use tensor.metal.metalAdamwStep
-use tensor.cuda.cudaAdamwStep
+use tensor.cuda.{cudaAdamwStep, cudaAdamwBatchReset, cudaAdamwBatchPush, cudaAdamwBatchRun}
 use tensor.ops.{add, mul, scale, matmul, transpose2d, l2NormFloat}
 use tensor.ad.{Params, mapParams, zipParams, collectParams, gradNorm}
 
@@ -110,28 +110,68 @@ pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, 
             let pOutVec = vecNew();
             let mOutVec = vecNew();
             let vOutVec = vecNew();
-            let i = cellNew(0);
-            while (cellGet(i) < n) {
-                let idx = cellGet(i);
-                match (vecGet(pVec, idx), vecGet(gVec, idx), vecGet(mVec, idx), vecGet(vVec, idx)) {
-                    (Some(p), Some(g), Some(m), Some(v)) -> {
-                        let pOut = allocTensorOn(p.shape, p.device);
-                        let mOut = allocTensorOn(m.shape, m.device);
-                        let vOut = allocTensorOn(v.shape, v.device);
-                        if (isCuda(p.device)) {
-                            cudaAdamwStep(devId(p.device), p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
-                        } else if (isMetal(p.device)) {
-                            metalAdamwStep(p.gpuBuf, g.gpuBuf, m.gpuBuf, v.gpuBuf, pOut.gpuBuf, mOut.gpuBuf, vOut.gpuBuf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
-                        } else {
-                            cpuAdamwStep(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
-                        };
-                        vecPush(pOutVec, pOut);
-                        vecPush(mOutVec, mOut);
-                        vecPush(vOutVec, vOut)
-                    },
-                    _ -> (),
+
+            // Check if all parameters live on the same CUDA device -> single multi-tensor launch!
+            let allSameCuda = cellNew(n > 0);
+            let cuDev = cellNew(-1);
+            let chk = cellNew(0);
+            while (cellGet(chk) < n && cellGet(allSameCuda)) {
+                match vecGet(pVec, cellGet(chk)) {
+                    Some(p) -> if (isCuda(p.device)) {
+                        let d = devId(p.device);
+                        if (cellGet(cuDev) < 0) cellSet(cuDev, d)
+                        else if (cellGet(cuDev) != d) cellSet(allSameCuda, false)
+                        else ()
+                    } else cellSet(allSameCuda, false),
+                    None -> cellSet(allSameCuda, false),
                 };
-                cellSet(i, idx + 1)
+                cellSet(chk, cellGet(chk) + 1)
+            };
+
+            if (cellGet(allSameCuda) && n > 1) {
+                cudaAdamwBatchReset();
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let idx = cellGet(i);
+                    match (vecGet(pVec, idx), vecGet(gVec, idx), vecGet(mVec, idx), vecGet(vVec, idx)) {
+                        (Some(p), Some(g), Some(m), Some(v)) -> {
+                            let pOut = allocTensorOn(p.shape, p.device);
+                            let mOut = allocTensorOn(m.shape, m.device);
+                            let vOut = allocTensorOn(v.shape, v.device);
+                            cudaAdamwBatchPush(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel);
+                            vecPush(pOutVec, pOut);
+                            vecPush(mOutVec, mOut);
+                            vecPush(vOutVec, vOut)
+                        },
+                        _ -> (),
+                    };
+                    cellSet(i, idx + 1)
+                };
+                cudaAdamwBatchRun(cellGet(cuDev), lr32, b132, b232, eps32, wd32, bc1, bc2)
+            } else {
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let idx = cellGet(i);
+                    match (vecGet(pVec, idx), vecGet(gVec, idx), vecGet(mVec, idx), vecGet(vVec, idx)) {
+                        (Some(p), Some(g), Some(m), Some(v)) -> {
+                            let pOut = allocTensorOn(p.shape, p.device);
+                            let mOut = allocTensorOn(m.shape, m.device);
+                            let vOut = allocTensorOn(v.shape, v.device);
+                            if (isCuda(p.device)) {
+                                cudaAdamwStep(devId(p.device), p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
+                            } else if (isMetal(p.device)) {
+                                metalAdamwStep(p.gpuBuf, g.gpuBuf, m.gpuBuf, v.gpuBuf, pOut.gpuBuf, mOut.gpuBuf, vOut.gpuBuf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
+                            } else {
+                                cpuAdamwStep(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
+                            };
+                            vecPush(pOutVec, pOut);
+                            vecPush(mOutVec, mOut);
+                            vecPush(vOutVec, vOut)
+                        },
+                        _ -> (),
+                    };
+                    cellSet(i, idx + 1)
+                }
             };
 
             let newModel = rebuildFromVec(model, pOutVec);

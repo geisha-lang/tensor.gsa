@@ -16,7 +16,7 @@ use std.str.intToStr
 use tensor.tensor.{
     Tensor, IrOp, IrInput, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
     JitTrace, beginJitTrace, endJitTrace, jitStampInput,
-    allocTensorOn, detach, isMetal, syncDevice,
+    allocTensorOn, detach, isMetal, isCuda, syncDevice,
     getActiveTape, setActiveTape, beginTape, stampLeaf, customVjp, runBackwardWithSeed, zerosLike
 }
 use tensor.metal.{metalCompileCustomKernel, metalDispatchJit}
@@ -340,7 +340,7 @@ def executeTrace(tr: JitTrace, symOut: Tensor): Tensor = {
 // ============================================================================
 
 pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
-    if (a.nodeId >= 0) f(a)
+    if (a.nodeId >= 0 || isCuda(a.device)) f(a)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);
@@ -350,7 +350,7 @@ pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
     }
 
 pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
-    if (a.nodeId >= 0 || b.nodeId >= 0) f(a, b)
+    if (a.nodeId >= 0 || b.nodeId >= 0 || isCuda(a.device) || isCuda(b.device)) f(a, b)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);
@@ -361,7 +361,7 @@ pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
     }
 
 pub def jit3(a: Tensor, b: Tensor, c: Tensor, f: (Tensor, Tensor, Tensor) -> Tensor): Tensor =
-    if (a.nodeId >= 0 || b.nodeId >= 0 || c.nodeId >= 0) f(a, b, c)
+    if (a.nodeId >= 0 || b.nodeId >= 0 || c.nodeId >= 0 || isCuda(a.device) || isCuda(b.device) || isCuda(c.device)) f(a, b, c)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);

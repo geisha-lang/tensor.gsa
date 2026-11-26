@@ -31,8 +31,8 @@ use tensor.tensor.{
     Tensor, IntTensor, allocTensorOn, fullOn, zerosOn, cloneTensor, detach, item, axpyInPlace,
     shapeEq, dimAt, normalizeAxis, broadcastShape, broadcastStrides, packI32List, customVjp,
     isMetal, isCuda, syncDevice,
-    IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
-    getActiveJitTrace, jitPushScalar, jitRecordNode
+    IrOp, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
+    JitTrace, getActiveJitTrace, jitPushScalar, jitRecordNode
 }
 use tensor.metal.{
     metalSgemm, metalBgemm, metalBinopSame, metalScaleOrAxpy, metalUnary2, metalUnary3
@@ -86,231 +86,127 @@ def rawScaleTensor(a: Tensor, s: Float): Tensor = {
     out
 }
 
+def tryJitBin(op: Int, a: Tensor, b: Tensor, eager: () -> Tensor): Tensor =
+    match getActiveJitTrace() {
+        Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape))
+            jitRecordNode(tr, IrBin(op, a.irId, b.irId), a.shape, a.device)
+        else eager(),
+        None -> eager(),
+    }
+
+def tryJitUnary(x: Tensor, mkOp: JitTrace -> IrOp, eager: () -> Tensor): Tensor =
+    match getActiveJitTrace() {
+        Some(tr) -> if (x.irId >= 0) jitRecordNode(tr, mkOp(tr), x.shape, x.device)
+        else eager(),
+        None -> eager(),
+    }
+
 // ============================================================================
 // Broadcasting Arithmetic (`+`, `-`, `*`, `/`, `-x`) & Scalar Ops
 // ============================================================================
 
 pub def add(a: Tensor, b: Tensor): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape)) {
-            jitRecordNode(tr, IrBin(0, a.irId, b.irId), a.shape, a.device)
-        } else {
-            let out = rawBinop(0, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
-            customVjp([aid, bid], out, (g: Tensor) -> [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(g, bSh))])
-        },
-        None -> {
-            let out = rawBinop(0, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
-            customVjp([aid, bid], out, (g: Tensor) -> [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(g, bSh))])
-        },
-    }
+    tryJitBin(0, a, b, () -> {
+        let out = rawBinop(0, a, b);
+        let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
+        customVjp([aid, bid], out, (g: Tensor) -> [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(g, bSh))])
+    })
 
 pub def sub(a: Tensor, b: Tensor): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape)) {
-            jitRecordNode(tr, IrBin(1, a.irId, b.irId), a.shape, a.device)
-        } else {
-            let out = rawBinop(1, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ng = rawScaleTensor(g, -1.0);
-                [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(ng, bSh))]
-            })
-        },
-        None -> {
-            let out = rawBinop(1, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ng = rawScaleTensor(g, -1.0);
-                [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(ng, bSh))]
-            })
-        },
-    }
+    tryJitBin(1, a, b, () -> {
+        let out = rawBinop(1, a, b);
+        let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
+        customVjp([aid, bid], out, (g: Tensor) -> {
+            let ng = rawScaleTensor(g, -1.0);
+            [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(ng, bSh))]
+        })
+    })
 
 pub def mul(a: Tensor, b: Tensor): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape)) {
-            jitRecordNode(tr, IrBin(2, a.irId, b.irId), a.shape, a.device)
-        } else {
-            let out = rawBinop(2, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ga = unbroadcastRaw(rawBinop(2, g, bd), ad.shape);
-                let gb = unbroadcastRaw(rawBinop(2, g, ad), bd.shape);
-                [(aid, ga), (bid, gb)]
-            })
-        },
-        None -> {
-            let out = rawBinop(2, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ga = unbroadcastRaw(rawBinop(2, g, bd), ad.shape);
-                let gb = unbroadcastRaw(rawBinop(2, g, ad), bd.shape);
-                [(aid, ga), (bid, gb)]
-            })
-        },
-    }
+    tryJitBin(2, a, b, () -> {
+        let out = rawBinop(2, a, b);
+        let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
+        customVjp([aid, bid], out, (g: Tensor) -> {
+            let ga = unbroadcastRaw(rawBinop(2, g, bd), ad.shape);
+            let gb = unbroadcastRaw(rawBinop(2, g, ad), bd.shape);
+            [(aid, ga), (bid, gb)]
+        })
+    })
 
 pub def divT(a: Tensor, b: Tensor): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape)) {
-            jitRecordNode(tr, IrBin(3, a.irId, b.irId), a.shape, a.device)
-        } else {
-            let out = rawBinop(3, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
-                let b2 = rawBinop(2, bd, bd);
-                let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
-                let gbNeg = rawScaleTensor(gaRaw, -1.0);
-                [(aid, ga), (bid, unbroadcastRaw(gbNeg, bd.shape))]
-            })
-        },
-        None -> {
-            let out = rawBinop(3, a, b);
-            let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
-            customVjp([aid, bid], out, (g: Tensor) -> {
-                let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
-                let b2 = rawBinop(2, bd, bd);
-                let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
-                let gbNeg = rawScaleTensor(gaRaw, -1.0);
-                [(aid, ga), (bid, unbroadcastRaw(gbNeg, bd.shape))]
-            })
-        },
-    }
+    tryJitBin(3, a, b, () -> {
+        let out = rawBinop(3, a, b);
+        let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
+        customVjp([aid, bid], out, (g: Tensor) -> {
+            let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
+            let b2 = rawBinop(2, bd, bd);
+            let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
+            let gbNeg = rawScaleTensor(gaRaw, -1.0);
+            [(aid, ga), (bid, unbroadcastRaw(gbNeg, bd.shape))]
+        })
+    })
 
 pub def scale(a: Tensor, s: Float): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0) {
-            let si = jitPushScalar(tr, s);
-            jitRecordNode(tr, IrScale(a.irId, si), a.shape, a.device)
-        } else {
-            let out = rawScaleTensor(a, s);
-            let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> [(aid, rawScaleTensor(g, s))])
-        },
-        None -> {
-            let out = rawScaleTensor(a, s);
-            let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> [(aid, rawScaleTensor(g, s))])
-        },
-    }
+    tryJitUnary(a, (tr: JitTrace) -> IrScale(a.irId, jitPushScalar(tr, s)), () -> {
+        let out = rawScaleTensor(a, s);
+        let aid = a.nodeId;
+        customVjp([aid], out, (g: Tensor) -> [(aid, rawScaleTensor(g, s))])
+    })
 
 pub def addScalar(a: Tensor, s: Float): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0) {
-            let si = jitPushScalar(tr, s);
-            jitRecordNode(tr, IrAddScalar(a.irId, si), a.shape, a.device)
-        } else {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaAddScalar(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
-            else { syncDevice(a.device); cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel) };
-            let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> [(aid, g)])
-        },
-        None -> {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaAddScalar(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
-            else { syncDevice(a.device); cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel) };
-            let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> [(aid, g)])
-        },
-    }
+    tryJitUnary(a, (tr: JitTrace) -> IrAddScalar(a.irId, jitPushScalar(tr, s)), () -> {
+        let out = allocTensorOn(a.shape, a.device);
+        if (isCuda(a.device)) cudaAddScalar(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
+        else { syncDevice(a.device); cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel) };
+        let aid = a.nodeId;
+        customVjp([aid], out, (g: Tensor) -> [(aid, g)])
+    })
 
 pub def powScalar(a: Tensor, p: Float): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0) {
-            let si = jitPushScalar(tr, p);
-            jitRecordNode(tr, IrPowScalar(a.irId, si), a.shape, a.device)
-        } else {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaPowScalarFwd(devId(a.device), a.buf, floatToF32(p), out.buf, a.numel)
-            else { syncDevice(a.device); cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaPowScalarBwd(devId(g.device), ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-        None -> {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaPowScalarFwd(devId(a.device), a.buf, floatToF32(p), out.buf, a.numel)
-            else { syncDevice(a.device); cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaPowScalarBwd(devId(g.device), ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-    }
+    tryJitUnary(a, (tr: JitTrace) -> IrPowScalar(a.irId, jitPushScalar(tr, p)), () -> {
+        let out = allocTensorOn(a.shape, a.device);
+        if (isCuda(a.device)) cudaPowScalarFwd(devId(a.device), a.buf, floatToF32(p), out.buf, a.numel)
+        else { syncDevice(a.device); cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel) };
+        let aid = a.nodeId; let ad = detach(a);
+        customVjp([aid], out, (g: Tensor) -> {
+            let ga = allocTensorOn(ad.shape, g.device);
+            if (isCuda(g.device)) cudaPowScalarBwd(devId(g.device), ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel)
+            else { syncDevice(g.device); cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel) };
+            [(aid, ga)]
+        })
+    })
 
 pub def clamp(a: Tensor, lo: Float, hi: Float): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0) {
-            let lsi = jitPushScalar(tr, lo);
-            let hsi = jitPushScalar(tr, hi);
-            jitRecordNode(tr, IrClamp(a.irId, lsi, hsi), a.shape, a.device)
-        } else {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaClampFwd(devId(a.device), a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel)
-            else { syncDevice(a.device); cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaClampBwd(devId(g.device), ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-        None -> {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaClampFwd(devId(a.device), a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel)
-            else { syncDevice(a.device); cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaClampBwd(devId(g.device), ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-    }
+    tryJitUnary(a, (tr: JitTrace) -> {
+        let lsi = jitPushScalar(tr, lo);
+        let hsi = jitPushScalar(tr, hi);
+        IrClamp(a.irId, lsi, hsi)
+    }, () -> {
+        let out = allocTensorOn(a.shape, a.device);
+        if (isCuda(a.device)) cudaClampFwd(devId(a.device), a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel)
+        else { syncDevice(a.device); cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel) };
+        let aid = a.nodeId; let ad = detach(a);
+        customVjp([aid], out, (g: Tensor) -> {
+            let ga = allocTensorOn(ad.shape, g.device);
+            if (isCuda(g.device)) cudaClampBwd(devId(g.device), ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel)
+            else { syncDevice(g.device); cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel) };
+            [(aid, ga)]
+        })
+    })
 
 pub def leakyRelu(a: Tensor, slope: Float): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (a.irId >= 0) {
-            let si = jitPushScalar(tr, slope);
-            jitRecordNode(tr, IrLeakyRelu(a.irId, si), a.shape, a.device)
-        } else {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaLeakyReluFwd(devId(a.device), a.buf, floatToF32(slope), out.buf, a.numel)
-            else { syncDevice(a.device); cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaLeakyReluBwd(devId(g.device), ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-        None -> {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isCuda(a.device)) cudaLeakyReluFwd(devId(a.device), a.buf, floatToF32(slope), out.buf, a.numel)
-            else { syncDevice(a.device); cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel) };
-            let aid = a.nodeId; let ad = detach(a);
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(ad.shape, g.device);
-                if (isCuda(g.device)) cudaLeakyReluBwd(devId(g.device), ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel)
-                else { syncDevice(g.device); cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel) };
-                [(aid, ga)]
-            })
-        },
-    }
+    tryJitUnary(a, (tr: JitTrace) -> IrLeakyRelu(a.irId, jitPushScalar(tr, slope)), () -> {
+        let out = allocTensorOn(a.shape, a.device);
+        if (isCuda(a.device)) cudaLeakyReluFwd(devId(a.device), a.buf, floatToF32(slope), out.buf, a.numel)
+        else { syncDevice(a.device); cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel) };
+        let aid = a.nodeId; let ad = detach(a);
+        customVjp([aid], out, (g: Tensor) -> {
+            let ga = allocTensorOn(ad.shape, g.device);
+            if (isCuda(g.device)) cudaLeakyReluBwd(devId(g.device), ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel)
+            else { syncDevice(g.device); cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel) };
+            [(aid, ga)]
+        })
+    })
 
 pub def negT(a: Tensor): Tensor = scale(a, -1.0)
 
@@ -325,68 +221,35 @@ instance Neg Tensor { def neg(a) = negT(a) }
 // ============================================================================
 
 def unaryOp(op: Int, x: Tensor): Tensor =
-    match getActiveJitTrace() {
-        Some(tr) -> if (x.irId >= 0) {
-            jitRecordNode(tr, IrUnary(op, x.irId), x.shape, x.device)
+    tryJitUnary(x, (_: JitTrace) -> IrUnary(op, x.irId), () -> {
+        let out = allocTensorOn(x.shape, x.device);
+        let useCuda = isCuda(x.device);
+        let useMetal = isMetal(x.device) && (op == 7 || op == 9 || op == 11);
+        if (useCuda) {
+            cudaUnaryFwd(devId(x.device), op, x.buf, out.buf, x.numel)
+        } else if (useMetal) {
+            let kn = if (op == 7) "k_sigmoid_fwd" else if (op == 9) "k_silu_fwd" else "k_relu_fwd";
+            metalUnary2(kn, x.gpuBuf, out.gpuBuf, x.numel)
         } else {
-            let out = allocTensorOn(x.shape, x.device);
-            let useCuda = isCuda(x.device);
-            let useMetal = isMetal(x.device) && (op == 7 || op == 9 || op == 11);
+            syncDevice(x.device);
+            cpuUnaryFwd(op, x.buf, out.buf, x.numel)
+        };
+        let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
+        customVjp([xid], out, (g: Tensor) -> {
+            let gx = allocTensorOn(xd.shape, g.device);
             if (useCuda) {
-                cudaUnaryFwd(devId(x.device), op, x.buf, out.buf, x.numel)
+                cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
             } else if (useMetal) {
-                let kn = if (op == 7) "k_sigmoid_fwd" else if (op == 9) "k_silu_fwd" else "k_relu_fwd";
-                metalUnary2(kn, x.gpuBuf, out.gpuBuf, x.numel)
+                if (op == 7) metalUnary3("k_sigmoid_bwd", yd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
+                else if (op == 9) metalUnary3("k_silu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
+                else metalUnary3("k_relu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
             } else {
-                syncDevice(x.device);
-                cpuUnaryFwd(op, x.buf, out.buf, x.numel)
+                syncDevice(g.device);
+                cpuUnaryBwd(op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
             };
-            let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
-            customVjp([xid], out, (g: Tensor) -> {
-                let gx = allocTensorOn(xd.shape, g.device);
-                if (useCuda) {
-                    cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
-                } else if (useMetal) {
-                    if (op == 7) metalUnary3("k_sigmoid_bwd", yd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                    else if (op == 9) metalUnary3("k_silu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                    else metalUnary3("k_relu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                } else {
-                    syncDevice(g.device);
-                    cpuUnaryBwd(op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
-                };
-                [(xid, gx)]
-            })
-        },
-        None -> {
-            let out = allocTensorOn(x.shape, x.device);
-            let useCuda = isCuda(x.device);
-            let useMetal = isMetal(x.device) && (op == 7 || op == 9 || op == 11);
-            if (useCuda) {
-                cudaUnaryFwd(devId(x.device), op, x.buf, out.buf, x.numel)
-            } else if (useMetal) {
-                let kn = if (op == 7) "k_sigmoid_fwd" else if (op == 9) "k_silu_fwd" else "k_relu_fwd";
-                metalUnary2(kn, x.gpuBuf, out.gpuBuf, x.numel)
-            } else {
-                syncDevice(x.device);
-                cpuUnaryFwd(op, x.buf, out.buf, x.numel)
-            };
-            let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
-            customVjp([xid], out, (g: Tensor) -> {
-                let gx = allocTensorOn(xd.shape, g.device);
-                if (useCuda) {
-                    cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
-                } else if (useMetal) {
-                    if (op == 7) metalUnary3("k_sigmoid_bwd", yd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                    else if (op == 9) metalUnary3("k_silu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                    else metalUnary3("k_relu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
-                } else {
-                    syncDevice(g.device);
-                    cpuUnaryBwd(op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
-                };
-                [(xid, gx)]
-            })
-        },
-    }
+            [(xid, gx)]
+        })
+    })
 
 pub def exp(x: Tensor): Tensor = unaryOp(0, x)
 pub def log(x: Tensor): Tensor = unaryOp(1, x)
