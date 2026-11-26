@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1006,6 +1007,140 @@ void gs_cu_adamw_batch_run(
         );
         off += batch;
     }
+}
+
+// ============================================================================
+// Runtime NVRTC JIT Compilation & Kernel Launch (zero extra link dependencies)
+// ============================================================================
+
+typedef void *GsNvrtcProg;
+typedef int (*FnNvrtcCreate)(GsNvrtcProg *, const char *, const char *, int, const char *const *, const char *const *);
+typedef int (*FnNvrtcCompile)(GsNvrtcProg, int, const char *const *);
+typedef int (*FnNvrtcGetPtxSize)(GsNvrtcProg, size_t *);
+typedef int (*FnNvrtcGetPtx)(GsNvrtcProg, char *);
+typedef int (*FnNvrtcDestroy)(GsNvrtcProg *);
+typedef int (*FnCuModLoadData)(void **, const void *);
+typedef int (*FnCuModGetFn)(void **, void *, const char *);
+typedef int (*FnCuLaunch)(void *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *, void **, void **);
+
+static int g_jit_probed = 0;
+static int g_jit_ready = 0;
+static FnNvrtcCreate p_nvrtcCreate = NULL;
+static FnNvrtcCompile p_nvrtcCompile = NULL;
+static FnNvrtcGetPtxSize p_nvrtcGetPtxSize = NULL;
+static FnNvrtcGetPtx p_nvrtcGetPtx = NULL;
+static FnNvrtcDestroy p_nvrtcDestroy = NULL;
+static FnCuModLoadData p_cuModLoadData = NULL;
+static FnCuModGetFn p_cuModGetFn = NULL;
+static FnCuLaunch p_cuLaunch = NULL;
+
+static int ensure_nvrtc_loaded(void) {
+    if (g_jit_probed) return g_jit_ready;
+    g_jit_probed = 1;
+    const char *nvrtc_names[] = {"libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2", NULL};
+    void *h_nvrtc = NULL;
+    for (int i = 0; nvrtc_names[i] && !h_nvrtc; i++) {
+        h_nvrtc = dlopen(nvrtc_names[i], RTLD_LAZY | RTLD_LOCAL);
+    }
+    void *h_cuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (!h_nvrtc || !h_cuda) return 0;
+    p_nvrtcCreate = (FnNvrtcCreate)dlsym(h_nvrtc, "nvrtcCreateProgram");
+    p_nvrtcCompile = (FnNvrtcCompile)dlsym(h_nvrtc, "nvrtcCompileProgram");
+    p_nvrtcGetPtxSize = (FnNvrtcGetPtxSize)dlsym(h_nvrtc, "nvrtcGetPTXSize");
+    p_nvrtcGetPtx = (FnNvrtcGetPtx)dlsym(h_nvrtc, "nvrtcGetPTX");
+    p_nvrtcDestroy = (FnNvrtcDestroy)dlsym(h_nvrtc, "nvrtcDestroyProgram");
+    p_cuModLoadData = (FnCuModLoadData)dlsym(h_cuda, "cuModuleLoadData");
+    p_cuModGetFn = (FnCuModGetFn)dlsym(h_cuda, "cuModuleGetFunction");
+    p_cuLaunch = (FnCuLaunch)dlsym(h_cuda, "cuLaunchKernel");
+    if (p_nvrtcCreate && p_nvrtcCompile && p_nvrtcGetPtxSize && p_nvrtcGetPtx && p_nvrtcDestroy &&
+        p_cuModLoadData && p_cuModGetFn && p_cuLaunch) {
+        g_jit_ready = 1;
+    }
+    return g_jit_ready;
+}
+
+int32_t gs_cu_jit_available(void) {
+    return ensure_nvrtc_loaded() ? 1 : 0;
+}
+
+void *gs_cu_jit_compile(int32_t dev_id, const char *src, const char *fn_name) {
+    if (!ensure_nvrtc_loaded() || !src || !fn_name) return NULL;
+    cudaSetDevice(dev_id);
+    cudaFree(0);
+    GsNvrtcProg prog = NULL;
+    if (p_nvrtcCreate(&prog, src, "jit.cu", 0, NULL, NULL) != 0) return NULL;
+    if (p_nvrtcCompile(prog, 0, NULL) != 0) {
+        p_nvrtcDestroy(&prog);
+        return NULL;
+    }
+    size_t ptx_sz = 0;
+    if (p_nvrtcGetPtxSize(prog, &ptx_sz) != 0 || ptx_sz == 0) {
+        p_nvrtcDestroy(&prog);
+        return NULL;
+    }
+    char *ptx = (char *)malloc(ptx_sz);
+    if (!ptx) {
+        p_nvrtcDestroy(&prog);
+        return NULL;
+    }
+    if (p_nvrtcGetPtx(prog, ptx) != 0) {
+        free(ptx);
+        p_nvrtcDestroy(&prog);
+        return NULL;
+    }
+    p_nvrtcDestroy(&prog);
+    void *mod = NULL;
+    void *fn = NULL;
+    int rc = p_cuModLoadData(&mod, ptx);
+    free(ptx);
+    if (rc != 0 || !mod) return NULL;
+    if (p_cuModGetFn(&fn, mod, fn_name) != 0) return NULL;
+    return fn;
+}
+
+static const void *g_jit_ins[16];
+static int32_t g_jit_n_in = 0;
+static float g_jit_scs[64];
+static int32_t g_jit_n_sc = 0;
+static float *g_jit_sc_dev = NULL;
+static int32_t g_jit_sc_cap = 0;
+
+void gs_cu_jit_launch_reset(void) {
+    g_jit_n_in = 0;
+    g_jit_n_sc = 0;
+}
+
+void gs_cu_jit_launch_push_in(const void *ptr) {
+    if (g_jit_n_in < 16) g_jit_ins[g_jit_n_in++] = ptr;
+}
+
+void gs_cu_jit_launch_push_sc(float v) {
+    if (g_jit_n_sc < 64) g_jit_scs[g_jit_n_sc++] = v;
+}
+
+void gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
+    if (!fn || n <= 0 || !p_cuLaunch) return;
+    cudaSetDevice(dev_id);
+    int32_t sc_cnt = g_jit_n_sc > 0 ? g_jit_n_sc : 1;
+    if (sc_cnt > g_jit_sc_cap) {
+        if (g_jit_sc_dev) cudaFree(g_jit_sc_dev);
+        if (cudaMalloc(&g_jit_sc_dev, (size_t)sc_cnt * sizeof(float)) != cudaSuccess) {
+            g_jit_sc_dev = NULL;
+            g_jit_sc_cap = 0;
+            return;
+        }
+        g_jit_sc_cap = sc_cnt;
+    }
+    if (g_jit_n_sc > 0) {
+        cudaMemcpyAsync(g_jit_sc_dev, g_jit_scs, (size_t)g_jit_n_sc * sizeof(float), cudaMemcpyHostToDevice, 0);
+    }
+    void *args[20];
+    int32_t k = 0;
+    for (int32_t i = 0; i < g_jit_n_in; i++) args[k++] = (void *)&g_jit_ins[i];
+    args[k++] = (void *)&out_ptr;
+    args[k++] = (void *)&g_jit_sc_dev;
+    args[k++] = (void *)&n;
+    p_cuLaunch(fn, (unsigned int)grid1d(n), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
 }
 
 } // extern "C"

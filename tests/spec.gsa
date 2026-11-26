@@ -16,8 +16,8 @@ use tensor.metal.metalAvailable
 use tensor.cuda.cudaDeviceCount
 use tensor.tensor.{Tensor, fromList, fromI32List, fromI32ListOn, randnOn, toDevice, getAt, item, shapeEq}
 use tensor.ops.{
-    add, sub, mul, divT, scale, addScalar, silu, sigmoid, exp, log, square, clamp,
-    rmsNorm, layerNorm, l2NormLast, logSumExpLast,
+    add, sub, mul, divT, scale, addScalar, silu, gelu, sigmoid, exp, log, square, clamp,
+    rmsNorm, layerNorm, l2NormLast, softmax, logSumExpLast, rope, transpose2d,
     crossEntropy, crossEntropyIgnore, mseLoss, matmul, matmulNT,
     sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
 }
@@ -254,6 +254,20 @@ def testMetalGpu(): Result Void String =
         let diff = l2NormFloat(toDevice(cGpu, Cpu) - cCpu);
         let _ = assertTrue("metal_mps_gemm_silu_parity", diff < 1.0e-3)?;
 
+        // Verify new Metal GPU kernels (RMSNorm, Softmax, GELU, Transpose2d, RoPE) match CPU
+        let wCpu = randnOn([24], intToI64(703), 0.5, Cpu);
+        let rmsCpu = rmsNorm(cCpu, wCpu, 1.0e-5);
+        let rmsGpu = rmsNorm(cGpu, toDevice(wCpu, Metal(0)), 1.0e-5);
+        let _ = assertTrue("metal_rms_parity", l2NormFloat(toDevice(rmsGpu, Cpu) - rmsCpu) < 1.0e-3)?;
+        let smCpu = softmax(cCpu);
+        let smGpu = softmax(cGpu);
+        let _ = assertTrue("metal_softmax_parity", l2NormFloat(toDevice(smGpu, Cpu) - smCpu) < 1.0e-3)?;
+        let gCpu = gelu(transpose2d(cCpu));
+        let gGpu = gelu(transpose2d(cGpu));
+        let _ = assertTrue("metal_gelu_t2d_parity", l2NormFloat(toDevice(gGpu, Cpu) - gCpu) < 1.0e-3)?;
+        let rCpu = randnOn([2, 4, 2, 8], intToI64(777), 0.5, Cpu);
+        let _ = assertTrue("metal_rope_parity", l2NormFloat(toDevice(rope(toDevice(rCpu, Metal(0)), 10000.0), Cpu) - rope(rCpu, 10000.0)) < 1.0e-3)?;
+
         // Full CausalLM training on Metal(0) with deferred command buffer + Metal AdamW
         let cfgM = LMConfig {
             vocabSize: 16, hiddenSize: 32, intermediateSize: 64,
@@ -355,6 +369,21 @@ def testCudaGpu(): Result Void String =
             cellSet(step, cellGet(step) + 1)
         };
         let _ = assertTrue("cuda_lm_loss_dropped", cellGet(lastLoss) < cellGet(firstLoss) * 0.35)?;
+
+        // CUDA NVRTC JIT fusion + zero recompile across shape & scalar changes
+        let c0 = jitCompileCount();
+        let h0 = jitCacheHits();
+        let x1 = randnOn([64, 32], intToI64(801), 0.4, Cuda(0));
+        let y1 = randnOn([64, 32], intToI64(802), 0.4, Cuda(0));
+        let e1 = clamp(silu(addScalar(scale(x1, 0.75) + y1, 0.1)) * y1, -2.0, 2.0);
+        let f1 = jit2(x1, y1, (a, b) -> clamp(silu(addScalar(scale(a, 0.75) + b, 0.1)) * b, -2.0, 2.0));
+        let _ = assertTrue("jit_cuda_parity_1", l2NormFloat(toDevice(f1, Cpu) - toDevice(e1, Cpu)) < 1.0e-3)?;
+        let x2 = randnOn([128, 64], intToI64(803), 0.4, Cuda(0));
+        let y2 = randnOn([128, 64], intToI64(804), 0.4, Cuda(0));
+        let e2 = clamp(silu(addScalar(scale(x2, 0.25) + y2, -0.3)) * y2, -1.5, 1.5);
+        let f2 = jit2(x2, y2, (a, b) -> clamp(silu(addScalar(scale(a, 0.25) + b, -0.3)) * b, -1.5, 1.5));
+        let _ = assertTrue("jit_cuda_parity_2", l2NormFloat(toDevice(f2, Cpu) - toDevice(e2, Cpu)) < 1.0e-3)?;
+        let _ = assertTrue("jit_cuda_zero_recompile", jitCompileCount() <= c0 + 1 && jitCacheHits() >= h0 + 1)?;
         Ok(())
     }
 

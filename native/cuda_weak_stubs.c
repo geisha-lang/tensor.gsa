@@ -65,3 +65,9 @@ WEAK void gs_cu_adamw(int32_t d, const float *p, const float *g, const float *m,
 WEAK void gs_cu_adamw_batch_reset(void) {}
 WEAK void gs_cu_adamw_batch_push(const float *p, const float *g, const float *m, const float *v, float *po, float *mo, float *vo, int64_t n) { (void)p;(void)g;(void)m;(void)v;(void)po;(void)mo;(void)vo;(void)n; }
 WEAK void gs_cu_adamw_batch_run(int32_t d, float lr, float b1, float b2, float eps, float wd, float bc1, float bc2) { (void)d;(void)lr;(void)b1;(void)b2;(void)eps;(void)wd;(void)bc1;(void)bc2; }
+WEAK int32_t gs_cu_jit_available(void) { return 0; }
+WEAK void *gs_cu_jit_compile(int32_t d, const char *src, const char *fn_name) { (void)d;(void)src;(void)fn_name; return NULL; }
+WEAK void gs_cu_jit_launch_reset(void) {}
+WEAK void gs_cu_jit_launch_push_in(const void *p) { (void)p; }
+WEAK void gs_cu_jit_launch_push_sc(float v) { (void)v; }
+WEAK void gs_cu_jit_launch_run(int32_t d, void *fn, void *out_ptr, int32_t n) { (void)d;(void)fn;(void)out_ptr;(void)n; }

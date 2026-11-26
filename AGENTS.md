@@ -18,12 +18,13 @@
 - Both helpers **must** end with `__syncthreads()` after reading `float res = sh[0]` and before returning.
 - Without the trailing barrier, back-to-back calls inside the same kernel (`k_rms_b`, `k_ln_b`, `k_sm_f`, `k_ce_fwd_loss`) let fast warps overwrite `sh[tid]` for the second reduction before slow warps read `sh[0]` from the first, causing silent data races and NaN by step 2.
 
-### 3. Apple Metal ARM64 ABI & Unified Memory
+### 3. Apple Metal ARM64 ABI, MSL & Unified Memory
 - `MTLSize` is 24 bytes (> 16B), so AAPCS64 passes it **indirectly by pointer** (`withAlloca(24, ...)` `ScopedPtr`), never as 3 integer register arguments to `objc_msgSend`.
 - Metal tensors use Unified Memory (`MTLResourceStorageModeShared = 0`) with deferred `MTLCommandBuffer` batching. Any CPU read/write on a Metal tensor **must** call `syncDevice(dev)` first to commit and wait for pending GPU work.
+- In MSL shader strings, `half` is a reserved keyword (16-bit float) — never name local variables `half`.
 
 ### 4. JIT Fusion Backend Safety (`src/jit.gsa`)
-- `jit1` / `jit2` / `jit3` must guard against unsupported devices before tracing: until NVRTC execution is wired for CUDA, `Cuda` tensors must fall back to eager `f(...)` so `executeTrace` never dereferences a CUDA device pointer on CPU.
+- `jit1` / `jit2` / `jit3` support CPU (single-pass fused), Apple Metal (runtime MSL), and NVIDIA CUDA (runtime `dlopen("libnvrtc.so")` + `libcuda.so.1` PTX compilation with graceful fallback to eager if `libnvrtc` is unavailable).
 - Keep JIT topology signatures **shape-agnostic and scalar-value-agnostic** (lift all scalar constants into `tr.scalars`, pass `numel` at runtime).
 - In `src/ops.gsa`, route JIT-traceable ops through `tryJitBin` / `tryJitUnary` rather than duplicating eager + `customVjp` blocks.
 

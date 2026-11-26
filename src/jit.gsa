@@ -13,6 +13,7 @@ use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
 use std.buf.{StringBuf, bufNew, bufPushStr, bufToString}
 use std.str.intToStr
+use tensor.backend.devId
 use tensor.tensor.{
     Tensor, IrOp, IrInput, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
     JitTrace, beginJitTrace, endJitTrace, jitStampInput,
@@ -20,12 +21,17 @@ use tensor.tensor.{
     getActiveTape, setActiveTape, beginTape, stampLeaf, customVjp, runBackwardWithSeed, zerosLike
 }
 use tensor.metal.{metalCompileCustomKernel, metalDispatchJit}
+use tensor.cuda.{
+    cudaJitAvailable, cudaJitCompile, cudaJitLaunchReset,
+    cudaJitLaunchPushIn, cudaJitLaunchPushSc, cudaJitLaunchRun
+}
 
 // ============================================================================
 // Pipeline Cache & Compile Stats
 // ============================================================================
 
 def gJitMetalPipelines: StrMap Ptr = strMapNew()
+def gJitCudaKernels: StrMap Ptr = strMapNew()
 def gJitCompileCount: Cell Int = cellNew(0)
 def gJitCacheHits: Cell Int = cellNew(0)
 
@@ -303,7 +309,44 @@ def executeTraceCpu(tr: JitTrace, outId: Int, out: Tensor): Void = {
 
 def executeTrace(tr: JitTrace, symOut: Tensor): Tensor = {
     let out = allocTensorOn(symOut.shape, symOut.device);
-    if (isMetal(symOut.device)) {
+    if (isCuda(symOut.device)) {
+        let dev = devId(symOut.device);
+        let sig = buildTraceSignature(tr, symOut.irId);
+        let kfn = match strMapGet(gJitCudaKernels, sig) {
+            Some(cached) -> {
+                cellSet(gJitCacheHits, cellGet(gJitCacheHits) + 1);
+                cached
+            },
+            None -> {
+                let src = emitCudaKernel(tr, symOut.irId);
+                let compiled = cudaJitCompile(dev, src, "k_jit");
+                if (!ptrIsNull(compiled)) {
+                    strMapInsert(gJitCudaKernels, sig, compiled);
+                    cellSet(gJitCompileCount, cellGet(gJitCompileCount) + 1)
+                } else ();
+                compiled
+            },
+        };
+        cudaJitLaunchReset();
+        let i = cellNew(0);
+        while (cellGet(i) < vecLen(tr.inputs)) {
+            match vecGet(tr.inputs, cellGet(i)) {
+                Some(t) -> cudaJitLaunchPushIn(t.buf),
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        let s = cellNew(0);
+        while (cellGet(s) < vecLen(tr.scalars)) {
+            match vecGet(tr.scalars, cellGet(s)) {
+                Some(v) -> cudaJitLaunchPushSc(v),
+                None -> (),
+            };
+            cellSet(s, cellGet(s) + 1)
+        };
+        cudaJitLaunchRun(dev, kfn, out.buf, out.numel);
+        out
+    } else if (isMetal(symOut.device)) {
         let sig = buildTraceSignature(tr, symOut.irId);
         let pso = match strMapGet(gJitMetalPipelines, sig) {
             Some(cached) -> {
@@ -339,8 +382,11 @@ def executeTrace(tr: JitTrace, symOut: Tensor): Tensor = {
 // Public `jit1`, `jit2`, `jit3` & `checkpoint` APIs
 // ============================================================================
 
+def jitUnsupported(t: Tensor): Bool =
+    t.nodeId >= 0 || (isCuda(t.device) && !cudaJitAvailable())
+
 pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
-    if (a.nodeId >= 0 || isCuda(a.device)) f(a)
+    if (jitUnsupported(a)) f(a)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);
@@ -350,7 +396,7 @@ pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
     }
 
 pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
-    if (a.nodeId >= 0 || b.nodeId >= 0 || isCuda(a.device) || isCuda(b.device)) f(a, b)
+    if (jitUnsupported(a) || jitUnsupported(b)) f(a, b)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);
@@ -361,7 +407,7 @@ pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
     }
 
 pub def jit3(a: Tensor, b: Tensor, c: Tensor, f: (Tensor, Tensor, Tensor) -> Tensor): Tensor =
-    if (a.nodeId >= 0 || b.nodeId >= 0 || c.nodeId >= 0 || isCuda(a.device) || isCuda(b.device) || isCuda(c.device)) f(a, b, c)
+    if (jitUnsupported(a) || jitUnsupported(b) || jitUnsupported(c)) f(a, b, c)
     else {
         let tr = beginJitTrace();
         let sa = jitStampInput(tr, a);

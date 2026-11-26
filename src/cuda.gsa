@@ -89,6 +89,12 @@ extern noalloc "gs_cu_adamw_batch_push" def c_cu_adamw_batch_push(
 extern "gs_cu_adamw_batch_run" def c_cu_adamw_batch_run(
     dev: Int, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
 ): Void
+extern noalloc "gs_cu_jit_available" def c_cu_jit_available(): Int
+extern "gs_cu_jit_compile" def c_cu_jit_compile(dev: Int, src: String, fnName: String): Ptr
+extern noalloc "gs_cu_jit_launch_reset" def c_cu_jit_launch_reset(): Void
+extern noalloc "gs_cu_jit_launch_push_in" def c_cu_jit_launch_push_in(p: ScopedPtr): Void
+extern noalloc "gs_cu_jit_launch_push_sc" def c_cu_jit_launch_push_sc(v: Float32): Void
+extern noalloc "gs_cu_jit_launch_run" def c_cu_jit_launch_run(dev: Int, fn: Ptr, out: ScopedPtr, n: Int): Void
 
 // ============================================================================
 // Public Geisha Wrappers
@@ -191,3 +197,10 @@ pub def cudaAdamwBatchPush(
 pub def cudaAdamwBatchRun(
     dev: Int, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
 ): Void = c_cu_adamw_batch_run(dev, lr, b1, b2, eps, wd, bc1, bc2)
+
+pub def cudaJitAvailable(): Bool = c_cu_jit_available() != 0
+pub def cudaJitCompile(dev: Int, src: String, fnName: String): Ptr = c_cu_jit_compile(dev, src, fnName)
+pub def cudaJitLaunchReset(): Void = c_cu_jit_launch_reset()
+pub def cudaJitLaunchPushIn(p: ForeignPtr): Void = c_cu_jit_launch_push_in(p)
+pub def cudaJitLaunchPushSc(v: Float32): Void = c_cu_jit_launch_push_sc(v)
+pub def cudaJitLaunchRun(dev: Int, fn: Ptr, out: ForeignPtr, n: Int): Void = c_cu_jit_launch_run(dev, fn, out, n)

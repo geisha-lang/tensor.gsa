@@ -73,6 +73,119 @@ def mslSource(): String =
     + "  mo[i] = mi; vo[i] = vi;\n"
     + "  po[i] = p[i] * (1.0f - a.lr * a.wd) - a.lr * ((mi / a.bc1) / (sqrt(vi / a.bc2) + a.eps));\n"
     + "}\n"
+    + "kernel void k_unary_fwd(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], constant int& op [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+    + "  float v = x[i]; const float gc = 0.7978845608f;\n"
+    + "  if (op == 0) o[i] = exp(v);\n"
+    + "  else if (op == 1) o[i] = log(v);\n"
+    + "  else if (op == 2) o[i] = sqrt(v);\n"
+    + "  else if (op == 3) o[i] = rsqrt(v);\n"
+    + "  else if (op == 4) o[i] = fabs(v);\n"
+    + "  else if (op == 5) o[i] = v * v;\n"
+    + "  else if (op == 6) o[i] = tanh(v);\n"
+    + "  else if (op == 7) o[i] = 1.0f / (1.0f + exp(-v));\n"
+    + "  else if (op == 8) o[i] = round(v);\n"
+    + "  else if (op == 9) o[i] = v / (1.0f + exp(-v));\n"
+    + "  else if (op == 10) o[i] = 0.5f * v * (1.0f + tanh(gc * (v + 0.044715f * v * v * v)));\n"
+    + "  else o[i] = v > 0.0f ? v : 0.0f;\n"
+    + "}\n"
+    + "kernel void k_unary_bwd(device const float* x [[buffer(0)]], device const float* y [[buffer(1)]], device const float* gy [[buffer(2)]], device float* gx [[buffer(3)]], constant int& op [[buffer(4)]], uint i [[thread_position_in_grid]]) {\n"
+    + "  float v = x[i], yv = y[i], g = gy[i]; const float gc = 0.7978845608f;\n"
+    + "  if (op == 0) gx[i] = g * yv;\n"
+    + "  else if (op == 1) gx[i] = g / v;\n"
+    + "  else if (op == 2) gx[i] = g / (2.0f * yv + 1e-12f);\n"
+    + "  else if (op == 3) gx[i] = -0.5f * g * yv * yv * yv;\n"
+    + "  else if (op == 4) gx[i] = v > 0.0f ? g : (v < 0.0f ? -g : 0.0f);\n"
+    + "  else if (op == 5) gx[i] = 2.0f * v * g;\n"
+    + "  else if (op == 6) gx[i] = g * (1.0f - yv * yv);\n"
+    + "  else if (op == 7) gx[i] = g * yv * (1.0f - yv);\n"
+    + "  else if (op == 8) gx[i] = 0.0f;\n"
+    + "  else if (op == 9) { float s = 1.0f / (1.0f + exp(-v)); gx[i] = g * s * (1.0f + v * (1.0f - s)); }\n"
+    + "  else if (op == 10) { float v2 = v * v; float th = tanh(gc * (v + 0.044715f * v * v2)); gx[i] = g * (0.5f * (1.0f + th) + 0.5f * v * (1.0f - th * th) * gc * (1.0f + 0.134145f * v2)); }\n"
+    + "  else gx[i] = v > 0.0f ? g : 0.0f;\n"
+    + "}\n"
+    + "struct RmsArgs { int rows; int dim; float eps; };\n"
+    + "kernel void k_rms_fwd(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device float* o [[buffer(2)]], constant RmsArgs& a [[buffer(3)]], uint gid [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {\n"
+    + "  threadgroup float sh[256];\n"
+    + "  int r = int(gid); if (r >= a.rows) return;\n"
+    + "  device const float* xr = x + r * a.dim; device float* orow = o + r * a.dim;\n"
+    + "  float ss = 0.0f; for (int c = int(tid); c < a.dim; c += 256) ss += xr[c] * xr[c];\n"
+    + "  sh[tid] = ss; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float inv = rsqrt(sh[0] / float(a.dim) + a.eps);\n"
+    + "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (int c = int(tid); c < a.dim; c += 256) orow[c] = xr[c] * inv * w[c];\n"
+    + "}\n"
+    + "kernel void k_rms_bwd_x(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device const float* gy [[buffer(2)]], device float* gx [[buffer(3)]], device float* inv_out [[buffer(4)]], constant RmsArgs& a [[buffer(5)]], uint gid [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {\n"
+    + "  threadgroup float sh[256];\n"
+    + "  int r = int(gid); if (r >= a.rows) return;\n"
+    + "  device const float* xr = x + r * a.dim; device const float* gyr = gy + r * a.dim; device float* gxr = gx + r * a.dim;\n"
+    + "  float ss = 0.0f, dot = 0.0f;\n"
+    + "  for (int c = int(tid); c < a.dim; c += 256) { ss += xr[c] * xr[c]; dot += gyr[c] * w[c] * xr[c]; }\n"
+    + "  sh[tid] = ss; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float inv = rsqrt(sh[0] / float(a.dim) + a.eps);\n"
+    + "  if (tid == 0) inv_out[r] = inv;\n"
+    + "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  sh[tid] = dot; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float coeff = sh[0] * (inv * inv * inv) / float(a.dim);\n"
+    + "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (int c = int(tid); c < a.dim; c += 256) gxr[c] = gyr[c] * w[c] * inv - xr[c] * coeff;\n"
+    + "}\n"
+    + "kernel void k_rms_bwd_w(device const float* x [[buffer(0)]], device const float* gy [[buffer(1)]], device const float* inv_in [[buffer(2)]], device float* gw [[buffer(3)]], constant RmsArgs& a [[buffer(4)]], uint c [[thread_position_in_grid]]) {\n"
+    + "  if (int(c) >= a.dim) return;\n"
+    + "  float acc = 0.0f;\n"
+    + "  for (int r = 0; r < a.rows; r++) acc += gy[r * a.dim + int(c)] * x[r * a.dim + int(c)] * inv_in[r];\n"
+    + "  gw[c] = acc;\n"
+    + "}\n"
+    + "struct RowArgs { int rows; int cols; };\n"
+    + "kernel void k_sm_fwd(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], constant RowArgs& a [[buffer(2)]], uint gid [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {\n"
+    + "  threadgroup float sh[256];\n"
+    + "  int r = int(gid); if (r >= a.rows) return;\n"
+    + "  device const float* xr = x + r * a.cols; device float* orow = o + r * a.cols;\n"
+    + "  float lmx = -1.0e38f; for (int c = int(tid); c < a.cols; c += 256) if (xr[c] > lmx) lmx = xr[c];\n"
+    + "  sh[tid] = lmx; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s && sh[tid + s] > sh[tid]) sh[tid] = sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float mx = sh[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  float lsum = 0.0f; for (int c = int(tid); c < a.cols; c += 256) { float e = exp(xr[c] - mx); orow[c] = e; lsum += e; }\n"
+    + "  sh[tid] = lsum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float inv = 1.0f / sh[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (int c = int(tid); c < a.cols; c += 256) orow[c] *= inv;\n"
+    + "}\n"
+    + "kernel void k_sm_bwd(device const float* y [[buffer(0)]], device const float* gy [[buffer(1)]], device float* gx [[buffer(2)]], constant RowArgs& a [[buffer(3)]], uint gid [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {\n"
+    + "  threadgroup float sh[256];\n"
+    + "  int r = int(gid); if (r >= a.rows) return;\n"
+    + "  device const float* yr = y + r * a.cols; device const float* gyr = gy + r * a.cols; device float* gxr = gx + r * a.cols;\n"
+    + "  float ldot = 0.0f; for (int c = int(tid); c < a.cols; c += 256) ldot += yr[c] * gyr[c];\n"
+    + "  sh[tid] = ldot; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (uint s = 128; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid + s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+    + "  float dot = sh[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    + "  for (int c = int(tid); c < a.cols; c += 256) gxr[c] = yr[c] * (gyr[c] - dot);\n"
+    + "}\n"
+    + "struct RopeArgs { int b; int s; int h; int hd; float th; int bwd; };\n"
+    + "kernel void k_rope(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], constant RopeArgs& a [[buffer(2)]], uint idx [[thread_position_in_grid]]) {\n"
+    + "  int hd2 = a.hd / 2; int tot = a.b * a.s * a.h * hd2; if (int(idx) >= tot) return;\n"
+    + "  int i = int(idx) % hd2; int rem = int(idx) / hd2;\n"
+    + "  int hi = rem % a.h; rem /= a.h; int t = rem % a.s; int bi = rem / a.s;\n"
+    + "  int base = ((bi * a.s + t) * a.h + hi) * a.hd;\n"
+    + "  float ang = float(t) / pow(a.th, float(2 * i) / float(a.hd));\n"
+    + "  float cs = cos(ang), sn = sin(ang), v0 = x[base + i], v1 = x[base + hd2 + i];\n"
+    + "  if (a.bwd == 0) { o[base + i] = v0 * cs - v1 * sn; o[base + hd2 + i] = v0 * sn + v1 * cs; }\n"
+    + "  else            { o[base + i] = v0 * cs + v1 * sn; o[base + hd2 + i] = -v0 * sn + v1 * cs; }\n"
+    + "}\n"
+    + "kernel void k_t2d(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], constant RowArgs& a [[buffer(2)]], uint idx [[thread_position_in_grid]]) {\n"
+    + "  int i = int(idx); if (i < a.rows * a.cols) o[(i % a.cols) * a.rows + (i / a.cols)] = x[i];\n"
+    + "}\n"
+    + "struct T0213Args { int d0; int d1; int d2; int d3; };\n"
+    + "kernel void k_t0213(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], constant T0213Args& a [[buffer(2)]], uint idx [[thread_position_in_grid]]) {\n"
+    + "  int i = int(idx); if (i >= a.d0 * a.d1 * a.d2 * a.d3) return;\n"
+    + "  int i3 = i % a.d3; int rem = i / a.d3; int i2 = rem % a.d2; rem /= a.d2; int i1 = rem % a.d1; int i0 = rem / a.d1;\n"
+    + "  o[(((i0 * a.d2 + i2) * a.d1 + i1) * a.d3) + i3] = x[i];\n"
+    + "}\n"
+    + "kernel void k_causal(device float* s [[buffer(0)]], constant RowArgs& a [[buffer(1)]], uint idx [[thread_position_in_grid]]) {\n"
+    + "  int i = int(idx); int seq = a.cols; if (i < a.rows * seq * seq) { if ((i % seq) > ((i / seq) % seq)) s[i] += -1.0e9f; }\n"
+    + "}\n"
 
 // ============================================================================
 // Lazy Singleton Metal Context & Deferred CommandBuffer
@@ -339,6 +452,19 @@ def dispatch1d(enc: Ptr, n: Int): Void = {
     )
 }
 
+def dispatchGroups1d(enc: Ptr, nGroups: Int, tgSize: Int): Void =
+    withAlloca(24, (gridSz) ->
+        withAlloca(24, (tgSz) -> {
+            scopedPtrWriteI64Le(gridSz, intToI64(0), intToI64(if (nGroups > 0) nGroups else 1));
+            scopedPtrWriteI64Le(gridSz, intToI64(8), intToI64(1));
+            scopedPtrWriteI64Le(gridSz, intToI64(16), intToI64(1));
+            scopedPtrWriteI64Le(tgSz, intToI64(0), intToI64(tgSize));
+            scopedPtrWriteI64Le(tgSz, intToI64(8), intToI64(1));
+            scopedPtrWriteI64Le(tgSz, intToI64(16), intToI64(1));
+            msg2_v_spsp(enc, c_sel("dispatchThreadgroups:threadsPerThreadgroup:"), gridSz, tgSz)
+        })
+    )
+
 pub def metalBinopSame(op: Int, aGpu: Option ForeignPtr, bGpu: Option ForeignPtr, outGpu: Option ForeignPtr, n: Int): Void =
     match getMetalCtx() {
         None -> (),
@@ -522,3 +648,259 @@ pub def metalAdamwStep(
         c_pool_pop(pool)
     },
 }
+
+pub def metalUnaryFwd(op: Int, xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_unary_fwd");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(4, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, op);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(4), intToI64(2))
+            });
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalUnaryBwd(op: Int, xGpu: Option ForeignPtr, yGpu: Option ForeignPtr, gyGpu: Option ForeignPtr, gxGpu: Option ForeignPtr, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_unary_bwd");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, yGpu), intToI64(0), intToI64(1));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gyGpu), intToI64(0), intToI64(2));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gxGpu), intToI64(0), intToI64(3));
+            withAlloca(4, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, op);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(4), intToI64(4))
+            });
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalRmsNormFwd(xGpu: Option ForeignPtr, wGpu: Option ForeignPtr, outGpu: Option ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_rms_fwd");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, wGpu), intToI64(0), intToI64(1));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(2));
+            withAlloca(12, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, rows);
+                scopedPtrWriteI32Le(sp, 4, dim);
+                scopedPtrWriteF32Le(sp, 8, floatToF32(eps));
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(12), intToI64(3))
+            });
+            dispatchGroups1d(enc, rows, 256);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalRmsNormBwd(xGpu: Option ForeignPtr, wGpu: Option ForeignPtr, gyGpu: Option ForeignPtr, gxGpu: Option ForeignPtr, gwGpu: Option ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let (_, invOpt) = metalAllocShared(intToI64(rows) * intToI64(4));
+            let invBuf = unwrapGpuBuf(ctx, invOpt);
+            let xBuf = unwrapGpuBuf(ctx, xGpu);
+            let wBuf = unwrapGpuBuf(ctx, wGpu);
+            let gyBuf = unwrapGpuBuf(ctx, gyGpu);
+            let gxBuf = unwrapGpuBuf(ctx, gxGpu);
+            let gwBuf = unwrapGpuBuf(ctx, gwGpu);
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            let selBytes = c_sel("setBytes:length:atIndex:");
+            withAlloca(12, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, rows);
+                scopedPtrWriteI32Le(sp, 4, dim);
+                scopedPtrWriteF32Le(sp, 8, floatToF32(eps));
+                msg1_v_p(enc, c_sel("setComputePipelineState:"), getPipeline(ctx, "k_rms_bwd_x"));
+                msg3_v_pi64i64(enc, selBuf, xBuf, intToI64(0), intToI64(0));
+                msg3_v_pi64i64(enc, selBuf, wBuf, intToI64(0), intToI64(1));
+                msg3_v_pi64i64(enc, selBuf, gyBuf, intToI64(0), intToI64(2));
+                msg3_v_pi64i64(enc, selBuf, gxBuf, intToI64(0), intToI64(3));
+                msg3_v_pi64i64(enc, selBuf, invBuf, intToI64(0), intToI64(4));
+                msg3_v_spi64i64(enc, selBytes, sp, intToI64(12), intToI64(5));
+                dispatchGroups1d(enc, rows, 256);
+
+                msg1_v_p(enc, c_sel("setComputePipelineState:"), getPipeline(ctx, "k_rms_bwd_w"));
+                msg3_v_pi64i64(enc, selBuf, xBuf, intToI64(0), intToI64(0));
+                msg3_v_pi64i64(enc, selBuf, gyBuf, intToI64(0), intToI64(1));
+                msg3_v_pi64i64(enc, selBuf, invBuf, intToI64(0), intToI64(2));
+                msg3_v_pi64i64(enc, selBuf, gwBuf, intToI64(0), intToI64(3));
+                msg3_v_spi64i64(enc, selBytes, sp, intToI64(12), intToI64(4));
+                dispatch1d(enc, dim)
+            });
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalSoftmaxFwd(xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, rows: Int, cols: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_sm_fwd");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(8, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, rows);
+                scopedPtrWriteI32Le(sp, 4, cols);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(8), intToI64(2))
+            });
+            dispatchGroups1d(enc, rows, 256);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalSoftmaxBwd(yGpu: Option ForeignPtr, gyGpu: Option ForeignPtr, gxGpu: Option ForeignPtr, rows: Int, cols: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_sm_bwd");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, yGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gyGpu), intToI64(0), intToI64(1));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gxGpu), intToI64(0), intToI64(2));
+            withAlloca(8, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, rows);
+                scopedPtrWriteI32Le(sp, 4, cols);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(8), intToI64(3))
+            });
+            dispatchGroups1d(enc, rows, 256);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalRope(xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, b: Int, s: Int, h: Int, hd: Int, th: Float, bwd: Bool): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_rope");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(24, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, b);
+                scopedPtrWriteI32Le(sp, 4, s);
+                scopedPtrWriteI32Le(sp, 8, h);
+                scopedPtrWriteI32Le(sp, 12, hd);
+                scopedPtrWriteF32Le(sp, 16, floatToF32(th));
+                scopedPtrWriteI32Le(sp, 20, if (bwd) 1 else 0);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(24), intToI64(2))
+            });
+            dispatch1d(enc, b * s * h * (hd / 2));
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalTranspose2d(xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, rows: Int, cols: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_t2d");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(8, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, rows);
+                scopedPtrWriteI32Le(sp, 4, cols);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(8), intToI64(2))
+            });
+            dispatch1d(enc, rows * cols);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalTranspose0213(xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_t0213");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(16, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, d0);
+                scopedPtrWriteI32Le(sp, 4, d1);
+                scopedPtrWriteI32Le(sp, 8, d2);
+                scopedPtrWriteI32Le(sp, 12, d3);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(16), intToI64(2))
+            });
+            dispatch1d(enc, d0 * d1 * d2 * d3);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalCausalMaskAdd(sGpu: Option ForeignPtr, bh: Int, seq: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, "k_causal");
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            msg3_v_pi64i64(enc, c_sel("setBuffer:offset:atIndex:"), unwrapGpuBuf(ctx, sGpu), intToI64(0), intToI64(0));
+            withAlloca(8, (sp) -> {
+                scopedPtrWriteI32Le(sp, 0, bh);
+                scopedPtrWriteI32Le(sp, 4, seq);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(8), intToI64(1))
+            });
+            dispatch1d(enc, bh * seq * seq);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
