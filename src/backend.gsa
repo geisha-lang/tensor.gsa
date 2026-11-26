@@ -1,6 +1,5 @@
-// Multi-backend `Device` ADT and minimal BLAS FFI (`tensor.backend`).
-// All CPU elementwise, broadcast, norm, reduction, activation, RoPE, PRNG and AdamW kernels
-// run in pure Geisha (`tensor.cpu`); `native/blas.c` provides only BLAS SGEMM/BGEMM.
+// Multi-backend `Device` ADT and direct CBLAS `cblas_sgemm` FFI (`tensor.backend`).
+// ZERO custom C files for CPU: calls Apple Accelerate / OpenBLAS `cblas_sgemm` directly!
 
 use std.generic
 
@@ -22,9 +21,76 @@ pub def devId(d: Device): Int = match d {
     Metal(i) -> i,
 }
 
-pub extern noalloc "gs_t_cuda_device_count" def c_cuda_device_count(): Int
-pub extern noalloc "gs_t_sgemm_cpu" def c_sgemm_cpu(ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
-pub extern noalloc "gs_t_bgemm_cpu" def c_bgemm_cpu(batch: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
+// Direct CBLAS standard ABI (`CblasRowMajor = 101`, `CblasNoTrans = 111`, `CblasTrans = 112`)
+extern noalloc "cblas_sgemm" def c_cblas_sgemm(
+    order: Int, transA: Int, transB: Int,
+    m: Int, n: Int, k: Int,
+    alpha: Float32, a: ScopedPtr, lda: Int,
+    b: ScopedPtr, ldb: Int,
+    beta: Float32, c: ScopedPtr, ldc: Int
+): Void
 
-pub def cudaDeviceCount(): Int = c_cuda_device_count()
-pub def autoDevice(): Device = if (c_cuda_device_count() > 0) Cuda(0) else Cpu
+extern "dlopen" def c_dlopen(path: String, flags: Int): Ptr
+extern "dlclose" def c_dlclose(h: Ptr): Int
+
+pub def sgemmCpu(
+    transA: Bool, transB: Bool,
+    m: Int, n: Int, k: Int,
+    alpha: Float32, a: ForeignPtr, b: ForeignPtr,
+    beta: Float32, c: ForeignPtr
+): Void =
+    if (m <= 0 || n <= 0 || k <= 0) ()
+    else {
+        let ta = if (transA) 112 else 111;
+        let tb = if (transB) 112 else 111;
+        let lda = if (transA) m else k;
+        let ldb = if (transB) k else n;
+        c_cblas_sgemm(101, ta, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, n)
+    }
+
+pub def bgemmCpu(
+    batch: Int, transA: Bool, transB: Bool,
+    m: Int, n: Int, k: Int,
+    alpha: Float32, a: ForeignPtr, b: ForeignPtr,
+    beta: Float32, c: ForeignPtr
+): Void =
+    if (batch <= 0 || m <= 0 || n <= 0 || k <= 0) ()
+    else {
+        let ta = if (transA) 112 else 111;
+        let tb = if (transB) 112 else 111;
+        let lda = if (transA) m else k;
+        let ldb = if (transB) k else n;
+        let strideA = m * k * 4;
+        let strideB = k * n * 4;
+        let strideC = m * n * 4;
+        withForeignPtr(a, (pa) ->
+            withForeignPtr(b, (pb) ->
+                withForeignPtr(c, (pc) -> {
+                    let i = cellNew(0);
+                    while (cellGet(i) < batch) {
+                        let bi = cellGet(i);
+                        c_cblas_sgemm(
+                            101, ta, tb, m, n, k,
+                            alpha,
+                            scopedPtrOffset(pa, bi * strideA), lda,
+                            scopedPtrOffset(pb, bi * strideB), ldb,
+                            beta,
+                            scopedPtrOffset(pc, bi * strideC), n
+                        );
+                        cellSet(i, bi + 1)
+                    }
+                })
+            )
+        )
+    }
+
+pub def cudaAvailable(): Bool = {
+    let h = c_dlopen("libcudart.so", 1);
+    if (ptrIsNull(h)) false
+    else {
+        let _ = c_dlclose(h);
+        true
+    }
+}
+
+pub def autoDevice(): Device = if (cudaAvailable()) Cuda(0) else Cpu

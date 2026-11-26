@@ -4,18 +4,14 @@ src_dir = "src"
 tests = ["tests/spec.gsa"]
 
 [target.native]
-c_sources = ["native/blas.c"]
-c_flags = ["-O3"]
 
 [[target.native.when]]
 os = "macos"
-c_flags = ["-DACCELERATE_NEW_LAPACK"]
 link_flags = ["-framework", "Accelerate"]
 
 [[target.native.when]]
 os = "linux"
 pkg_config = "openblas"
-defines = ["GS_TENSOR_OPENBLAS"]
 
 [[target.native.when]]
 tool = "nvcc"

@@ -4,7 +4,7 @@
 use std.option.{Option, Some, None}
 use std.list.{listLen, listNth, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
-use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaDeviceCount, autoDevice}
+use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaAvailable, autoDevice}
 use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
 
 // ============================================================================

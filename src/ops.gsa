@@ -3,7 +3,7 @@
 
 use std.option.{Option, Some, None}
 use std.list.{listLen, listRev}
-use tensor.backend.{Device, Cpu, c_sgemm_cpu, c_bgemm_cpu}
+use tensor.backend.{Device, Cpu, sgemmCpu, bgemmCpu}
 use tensor.cpu.{
     cpuBinopSame, cpuScale, cpuAddScalar, cpuPowScalarFwd, cpuPowScalarBwd,
     cpuClampFwd, cpuClampBwd, cpuLeakyReluFwd, cpuLeakyReluBwd,
@@ -213,7 +213,7 @@ pub def matmul(a: Tensor, b: Tensor): Tensor = {
     let k = dimAt(a.shape, 1);
     let n = dimAt(b.shape, 1);
     let out = allocTensorOn([m, n], a.device);
-    c_sgemm_cpu(0, 0, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    sgemmCpu(false, false, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
     let aid = a.nodeId;
     let bid = b.nodeId;
     let ad = detach(a);
@@ -221,8 +221,8 @@ pub def matmul(a: Tensor, b: Tensor): Tensor = {
     customVjp([aid, bid], out, (g: Tensor) -> {
         let ga = allocTensorOn([m, k], g.device);
         let gb = allocTensorOn([k, n], g.device);
-        c_sgemm_cpu(0, 1, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
-        c_sgemm_cpu(1, 0, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
+        sgemmCpu(false, true, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        sgemmCpu(true, false, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
         [(aid, ga), (bid, gb)]
     })
 }
@@ -233,7 +233,7 @@ pub def matmulNT(x: Tensor, w: Tensor): Tensor = {
     let rows = x.numel / inDim;
     let outShape = replaceLastDim(x.shape, outDim);
     let out = allocTensorOn(outShape, x.device);
-    c_sgemm_cpu(0, 1, rows, outDim, inDim, floatToF32(1.0), x.buf, w.buf, floatToF32(0.0), out.buf);
+    sgemmCpu(false, true, rows, outDim, inDim, floatToF32(1.0), x.buf, w.buf, floatToF32(0.0), out.buf);
     let xid = x.nodeId;
     let wid = w.nodeId;
     let xd = detach(x);
@@ -241,8 +241,8 @@ pub def matmulNT(x: Tensor, w: Tensor): Tensor = {
     customVjp([xid, wid], out, (g: Tensor) -> {
         let gx = allocTensorOn(xd.shape, g.device);
         let gw = allocTensorOn(wd.shape, g.device);
-        c_sgemm_cpu(0, 0, rows, inDim, outDim, floatToF32(1.0), g.buf, wd.buf, floatToF32(0.0), gx.buf);
-        c_sgemm_cpu(1, 0, outDim, inDim, rows, floatToF32(1.0), g.buf, xd.buf, floatToF32(0.0), gw.buf);
+        sgemmCpu(false, false, rows, inDim, outDim, floatToF32(1.0), g.buf, wd.buf, floatToF32(0.0), gx.buf);
+        sgemmCpu(true, false, outDim, inDim, rows, floatToF32(1.0), g.buf, xd.buf, floatToF32(0.0), gw.buf);
         [(xid, gx), (wid, gw)]
     })
 }
@@ -253,7 +253,7 @@ pub def bgemm(a: Tensor, b: Tensor): Tensor = {
     let k = dimAt(a.shape, 2);
     let n = dimAt(b.shape, 2);
     let out = allocTensorOn([batch, m, n], a.device);
-    c_bgemm_cpu(batch, 0, 0, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    bgemmCpu(batch, false, false, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
     let aid = a.nodeId;
     let bid = b.nodeId;
     let ad = detach(a);
@@ -261,8 +261,8 @@ pub def bgemm(a: Tensor, b: Tensor): Tensor = {
     customVjp([aid, bid], out, (g: Tensor) -> {
         let ga = allocTensorOn([batch, m, k], g.device);
         let gb = allocTensorOn([batch, k, n], g.device);
-        c_bgemm_cpu(batch, 0, 1, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
-        c_bgemm_cpu(batch, 1, 0, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
+        bgemmCpu(batch, false, true, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        bgemmCpu(batch, true, false, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
         [(aid, ga), (bid, gb)]
     })
 }
@@ -273,7 +273,7 @@ pub def bgemmNT(a: Tensor, b: Tensor): Tensor = {
     let k = dimAt(a.shape, 2);
     let n = dimAt(b.shape, 1);
     let out = allocTensorOn([batch, m, n], a.device);
-    c_bgemm_cpu(batch, 0, 1, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    bgemmCpu(batch, false, true, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
     let aid = a.nodeId;
     let bid = b.nodeId;
     let ad = detach(a);
@@ -281,8 +281,8 @@ pub def bgemmNT(a: Tensor, b: Tensor): Tensor = {
     customVjp([aid, bid], out, (g: Tensor) -> {
         let ga = allocTensorOn([batch, m, k], g.device);
         let gb = allocTensorOn([batch, n, k], g.device);
-        c_bgemm_cpu(batch, 0, 0, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
-        c_bgemm_cpu(batch, 1, 0, n, k, m, floatToF32(1.0), g.buf, ad.buf, floatToF32(0.0), gb.buf);
+        bgemmCpu(batch, false, false, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        bgemmCpu(batch, true, false, n, k, m, floatToF32(1.0), g.buf, ad.buf, floatToF32(0.0), gb.buf);
         [(aid, ga), (bid, gb)]
     })
 }
