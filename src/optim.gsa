@@ -4,10 +4,8 @@
 use std.option.{Some, None}
 use std.list.listLen
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet}
-use tensor.backend.{
-    devKind, devId, c_adamw_batch_new, c_adamw_batch_add, c_adamw_batch_run
-}
 use tensor.tensor.{Tensor, zerosLike, allocTensorOn, dimAt, adamwStepRaw, detach}
+use tensor.cpu.cpuAdamwStep
 use tensor.ops.{add, mul, scale, matmul, transpose2d, l2NormFloat}
 use tensor.ad.{Params, mapParams, zipParams, collectParams, gradNorm}
 
@@ -81,17 +79,20 @@ def rebuildFromVec(template, vec): forall m. (Params m) => (m, Vec Tensor) -> m 
     }, template)
 }
 
-// Single-launch Multi-Tensor Fused AdamW:
-// - Zero intermediate tensors (`g2`, `decayed`, etc. all eliminated)
-// - Single fused `gs_t_adamw_multi_step` kernel launch across all model parameters on CUDA & CPU
+// Fused single-pass AdamW across all model parameters (zero intermediate tensors!)
 pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, AdamWState m, m, m) -> (m, AdamWState m) =
     match (cfg, st) {
         (AdamWConfig { lr: lr, beta1: beta1, beta2: beta2, eps: eps, weightDecay: wd },
          AdamWState { step: curStep, m1: stM1, m2: stM2 }) -> {
             let nextStep = curStep + 1;
             let tF = floatToF32(intToFloat(nextStep));
-            let bc1 = 1.0 - f32ToFloat(mathPowF32(floatToF32(beta1), tF));
-            let bc2 = 1.0 - f32ToFloat(mathPowF32(floatToF32(beta2), tF));
+            let bc1 = floatToF32(1.0 - f32ToFloat(mathPowF32(floatToF32(beta1), tF)));
+            let bc2 = floatToF32(1.0 - f32ToFloat(mathPowF32(floatToF32(beta2), tF)));
+            let lr32 = floatToF32(lr);
+            let b132 = floatToF32(beta1);
+            let b232 = floatToF32(beta2);
+            let eps32 = floatToF32(eps);
+            let wd32 = floatToF32(wd);
 
             let pVec = vecNew();
             let gVec = vecNew();
@@ -106,23 +107,15 @@ pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, 
             let pOutVec = vecNew();
             let mOutVec = vecNew();
             let vOutVec = vecNew();
-            let batch = c_adamw_batch_new(n);
-            let devK = cellNew(0);
-            let devI = cellNew(0);
-
             let i = cellNew(0);
             while (cellGet(i) < n) {
                 let idx = cellGet(i);
                 match (vecGet(pVec, idx), vecGet(gVec, idx), vecGet(mVec, idx), vecGet(vVec, idx)) {
                     (Some(p), Some(g), Some(m), Some(v)) -> {
-                        if (idx == 0) {
-                            cellSet(devK, devKind(p.device));
-                            cellSet(devI, devId(p.device))
-                        } else ();
                         let pOut = allocTensorOn(p.shape, p.device);
                         let mOut = allocTensorOn(m.shape, m.device);
                         let vOut = allocTensorOn(v.shape, v.device);
-                        c_adamw_batch_add(batch, p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, intToI64(p.numel));
+                        cpuAdamwStep(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2);
                         vecPush(pOutVec, pOut);
                         vecPush(mOutVec, mOut);
                         vecPush(vOutVec, vOut)
@@ -131,12 +124,6 @@ pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, 
                 };
                 cellSet(i, idx + 1)
             };
-
-            c_adamw_batch_run(
-                batch, cellGet(devK), cellGet(devI),
-                floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
-                floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
-            );
 
             let newModel = rebuildFromVec(model, pOutVec);
             let newM1 = rebuildFromVec(stM1, mOutVec);

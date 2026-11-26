@@ -4,10 +4,8 @@
 use std.option.{Option, Some, None}
 use std.list.{listLen, listNth, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
-use tensor.backend.{
-    Device, Cpu, Cuda, Metal, devKind, devId, cudaDeviceCount, autoDevice,
-    c_alloc, c_free_fn, c_memcpy_dev, c_fill, c_copy, c_randn, c_axpy, c_adamw_step
-}
+use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaDeviceCount, autoDevice}
+use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
 
 // ============================================================================
 // Tensor & IntTensor Types
@@ -84,7 +82,6 @@ pub def broadcastShape(a: List Int, b: List Int): List Int = {
     listRev(cellGet(acc))
 }
 
-// Compute right-aligned broadcast strides for `inShape` broadcast to `outShape` (stride=0 on broadcast dims).
 pub def broadcastStrides(inShape: List Int, outShape: List Int): List Int = {
     let nd = listLen(outShape);
     let padded = padLeftOnes(inShape, nd);
@@ -134,12 +131,8 @@ pub def packI32List(xs: List Int): ForeignPtr = {
 // Allocation, Creation & Device Transfer
 // ============================================================================
 
-pub def allocBuf(dev: Device, nbytes: Int64): ForeignPtr = {
-    let dk = devKind(dev);
-    let raw = c_alloc(dk, devId(dev), nbytes);
-    let ffn = c_free_fn(dk);
-    foreignPtrNew(raw, ffn, nbytes)
-}
+pub def allocBuf(_dev: Device, nbytes: Int64): ForeignPtr =
+    foreignPtrAlloc(if (nbytes > intToI64(0)) nbytes else intToI64(4))
 
 pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
     let n = shapeProd(sh);
@@ -152,7 +145,7 @@ pub def zeros(sh: List Int): Tensor = zerosOn(sh, Cpu)
 
 pub def fullOn(sh: List Int, val: Float, dev: Device): Tensor = {
     let t = allocTensorOn(sh, dev);
-    c_fill(devKind(dev), devId(dev), t.buf, intToI64(t.numel), floatToF32(val));
+    cpuFill(t.buf, t.numel, floatToF32(val));
     t
 }
 
@@ -164,7 +157,7 @@ pub def onesLike(t: Tensor): Tensor = onesOn(t.shape, t.device)
 
 pub def randnOn(sh: List Int, seed: Int64, std: Float, dev: Device): Tensor = {
     let t = allocTensorOn(sh, dev);
-    c_randn(devKind(dev), devId(dev), t.buf, intToI64(t.numel), seed, floatToF32(std));
+    cpuRandn(t.buf, t.numel, seed, std);
     t
 }
 
@@ -204,8 +197,8 @@ pub def fromList(sh: List Int, xs: List Float): Tensor = {
 pub def fromI32ListOn(sh: List Int, xs: List Int, dev: Device): IntTensor = {
     let n = shapeProd(sh);
     let nb = intToI64(n) * intToI64(4);
-    let hostBuf = allocBuf(Cpu, nb);
-    withForeignPtr(hostBuf, (sp) -> {
+    let buf = allocBuf(dev, nb);
+    withForeignPtr(buf, (sp) -> {
         let cur = cellNew(xs);
         let i = cellNew(0);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -219,13 +212,7 @@ pub def fromI32ListOn(sh: List Int, xs: List Int, dev: Device): IntTensor = {
             }
         }
     });
-    if (dev == Cpu) {
-        IntTensor { buf: hostBuf, shape: sh, numel: n, device: Cpu }
-    } else {
-        let devBuf = allocBuf(dev, nb);
-        c_memcpy_dev(devBuf, devKind(dev), devId(dev), hostBuf, 0, 0, nb);
-        IntTensor { buf: devBuf, shape: sh, numel: n, device: dev }
-    }
+    IntTensor { buf: buf, shape: sh, numel: n, device: dev }
 }
 
 pub def fromI32List(sh: List Int, xs: List Int): IntTensor = fromI32ListOn(sh, xs, Cpu)
@@ -236,26 +223,22 @@ pub def toDevice(t: Tensor, dev: Device): Tensor =
     if (t.device == dev) t
     else {
         let out = allocTensorOn(t.shape, dev);
-        let nb = intToI64(t.numel) * intToI64(4);
-        c_memcpy_dev(out.buf, devKind(dev), devId(dev), t.buf, devKind(t.device), devId(t.device), nb);
+        cpuCopy(out.buf, t.buf, t.numel);
         out
     }
 
 pub def detach(t: Tensor): Tensor =
     Tensor { buf: t.buf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1 }
 
-pub def getAt(t: Tensor, idx: Int): Float = {
-    let h = toDevice(t, Cpu);
-    withForeignPtr(h.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
-}
+pub def getAt(t: Tensor, idx: Int): Float =
+    withForeignPtr(t.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
 
 pub def item(t: Tensor): Float = getAt(t, 0)
 
-pub def toList(t: Tensor): List Float = {
-    let h = toDevice(t, Cpu);
-    withForeignPtr(h.buf, (sp) -> {
+pub def toList(t: Tensor): List Float =
+    withForeignPtr(t.buf, (sp) -> {
         let acc = cellNew(Nil);
-        let i = cellNew(h.numel - 1);
+        let i = cellNew(t.numel - 1);
         while (cellGet(i) >= 0) {
             let v = f32ToFloat(scopedPtrReadF32Le(sp, cellGet(i) * 4));
             cellSet(acc, Cons(v, cellGet(acc)));
@@ -263,14 +246,13 @@ pub def toList(t: Tensor): List Float = {
         };
         cellGet(acc)
     })
-}
 
 pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void =
-    c_axpy(devKind(y.device), devId(y.device), floatToF32(alpha), x.buf, y.buf, intToI64(y.numel))
+    cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel)
 
 pub def cloneTensor(t: Tensor): Tensor = {
     let out = allocTensorOn(t.shape, t.device);
-    c_copy(devKind(t.device), devId(t.device), out.buf, t.buf, intToI64(t.numel));
+    cpuCopy(out.buf, t.buf, t.numel);
     out
 }
 
@@ -281,11 +263,10 @@ pub def adamwStepRaw(
     let pOut = allocTensorOn(p.shape, p.device);
     let mOut = allocTensorOn(m.shape, m.device);
     let vOut = allocTensorOn(v.shape, v.device);
-    c_adamw_step(
-        devKind(p.device), devId(p.device),
+    cpuAdamwStep(
         p.buf, g.buf, m.buf, v.buf,
         pOut.buf, mOut.buf, vOut.buf,
-        intToI64(p.numel),
+        p.numel,
         floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
         floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
     );

@@ -1,0 +1,1146 @@
+// Pure-Geisha CPU Tensor Kernels (`tensor.cpu`).
+// Uses `ForeignPtr` + `withForeignPtr` + `ScopedPtr` Float32 reads/writes and
+// LLVM math intrinsics in allocation-free leaf loops (safepoint-free & auto-vectorizable).
+
+use std.list.{listLen}
+
+// ============================================================================
+// Basic Fill / Copy / Elementwise / Scalar / AXPY
+// ============================================================================
+
+pub def cpuFill(dst: ForeignPtr, n: Int, val: Float32): Void =
+    withForeignPtr(dst, (d) -> {
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            scopedPtrWriteF32Le(d, cellGet(i) * 4, val);
+            cellSet(i, cellGet(i) + 1)
+        }
+    })
+
+pub def cpuCopy(dst: ForeignPtr, src: ForeignPtr, n: Int): Void =
+    withForeignPtr(dst, (d) ->
+        withForeignPtr(src, (s) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                scopedPtrWriteF32Le(d, off, scopedPtrReadF32Le(s, off));
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuBinopSame(op: Int, a: ForeignPtr, b: ForeignPtr, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(b, (pb) ->
+            withForeignPtr(out, (po) -> {
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let off = cellGet(i) * 4;
+                    let va = scopedPtrReadF32Le(pa, off);
+                    let vb = scopedPtrReadF32Le(pb, off);
+                    let r =
+                        if (op == 0) va + vb
+                        else if (op == 1) va - vb
+                        else if (op == 2) va * vb
+                        else va / vb;
+                    scopedPtrWriteF32Le(po, off, r);
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuScale(a: ForeignPtr, s: Float32, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(out, (po) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                scopedPtrWriteF32Le(po, off, scopedPtrReadF32Le(pa, off) * s);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuAddScalar(a: ForeignPtr, s: Float32, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(out, (po) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                scopedPtrWriteF32Le(po, off, scopedPtrReadF32Le(pa, off) + s);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuAxpy(alpha: Float32, x: ForeignPtr, y: ForeignPtr, n: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(y, (py) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                let vy = scopedPtrReadF32Le(py, off);
+                let vx = scopedPtrReadF32Le(px, off);
+                scopedPtrWriteF32Le(py, off, mathFmaF32(alpha, vx, vy));
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuPowScalarFwd(a: ForeignPtr, p: Float32, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(out, (po) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                scopedPtrWriteF32Le(po, off, mathPowF32(scopedPtrReadF32Le(pa, off), p));
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuPowScalarBwd(a: ForeignPtr, gy: ForeignPtr, p: Float32, gx: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let pm1 = p - floatToF32(1.0);
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let off = cellGet(i) * 4;
+                    let v = scopedPtrReadF32Le(pa, off);
+                    let g = scopedPtrReadF32Le(pgy, off);
+                    scopedPtrWriteF32Le(pgx, off, g * p * mathPowF32(v, pm1));
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuClampFwd(a: ForeignPtr, lo: Float32, hi: Float32, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(out, (po) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                let v = scopedPtrReadF32Le(pa, off);
+                let r = if (v < lo) lo else if (v > hi) hi else v;
+                scopedPtrWriteF32Le(po, off, r);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuClampBwd(a: ForeignPtr, gy: ForeignPtr, lo: Float32, hi: Float32, gx: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let zero = floatToF32(0.0);
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let off = cellGet(i) * 4;
+                    let v = scopedPtrReadF32Le(pa, off);
+                    let r = if (v >= lo && v <= hi) scopedPtrReadF32Le(pgy, off) else zero;
+                    scopedPtrWriteF32Le(pgx, off, r);
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuLeakyReluFwd(a: ForeignPtr, slope: Float32, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(out, (po) -> {
+            let zero = floatToF32(0.0);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                let v = scopedPtrReadF32Le(pa, off);
+                scopedPtrWriteF32Le(po, off, if (v > zero) v else slope * v);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuLeakyReluBwd(a: ForeignPtr, gy: ForeignPtr, slope: Float32, gx: ForeignPtr, n: Int): Void =
+    withForeignPtr(a, (pa) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let zero = floatToF32(0.0);
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let off = cellGet(i) * 4;
+                    let v = scopedPtrReadF32Le(pa, off);
+                    let g = scopedPtrReadF32Le(pgy, off);
+                    scopedPtrWriteF32Le(pgx, off, if (v > zero) g else slope * g);
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+
+// ============================================================================
+// General N-D Broadcasting Binary Op & Unbroadcast Sum Reduction
+// ============================================================================
+
+pub def cpuBcastBinop(
+    op: Int, ndim: Int, total: Int,
+    outShape: ForeignPtr, aStrides: ForeignPtr, bStrides: ForeignPtr,
+    a: ForeignPtr, b: ForeignPtr, out: ForeignPtr
+): Void =
+    withForeignPtr(outShape, (psh) ->
+        withForeignPtr(aStrides, (psa) ->
+            withForeignPtr(bStrides, (psb) ->
+                withForeignPtr(a, (pa) ->
+                    withForeignPtr(b, (pb) ->
+                        withForeignPtr(out, (po) -> {
+                            let idx = cellNew(0);
+                            while (cellGet(idx) < total) {
+                                let rem = cellNew(cellGet(idx));
+                                let oa = cellNew(0);
+                                let ob = cellNew(0);
+                                let d = cellNew(ndim - 1);
+                                while (cellGet(d) >= 0) {
+                                    let doff = cellGet(d) * 4;
+                                    let shd = scopedPtrReadI32Le(psh, doff);
+                                    let rcur = cellGet(rem);
+                                    let coord = rcur % shd;
+                                    cellSet(rem, rcur / shd);
+                                    cellSet(oa, cellGet(oa) + coord * scopedPtrReadI32Le(psa, doff));
+                                    cellSet(ob, cellGet(ob) + coord * scopedPtrReadI32Le(psb, doff));
+                                    cellSet(d, cellGet(d) - 1)
+                                };
+                                let va = scopedPtrReadF32Le(pa, cellGet(oa) * 4);
+                                let vb = scopedPtrReadF32Le(pb, cellGet(ob) * 4);
+                                let rv =
+                                    if (op == 0) va + vb
+                                    else if (op == 1) va - vb
+                                    else if (op == 2) va * vb
+                                    else va / vb;
+                                scopedPtrWriteF32Le(po, cellGet(idx) * 4, rv);
+                                cellSet(idx, cellGet(idx) + 1)
+                            }
+                        })
+                    )
+                )
+            )
+        )
+    )
+
+pub def cpuBcastReduceSum(
+    ndim: Int, srcTotal: Int, dstTotal: Int,
+    srcShape: ForeignPtr, dstStrides: ForeignPtr,
+    src: ForeignPtr, dst: ForeignPtr
+): Void = {
+    cpuFill(dst, dstTotal, floatToF32(0.0));
+    withForeignPtr(srcShape, (psh) ->
+        withForeignPtr(dstStrides, (psd) ->
+            withForeignPtr(src, (ps) ->
+                withForeignPtr(dst, (pd) -> {
+                    let idx = cellNew(0);
+                    while (cellGet(idx) < srcTotal) {
+                        let rem = cellNew(cellGet(idx));
+                        let od = cellNew(0);
+                        let d = cellNew(ndim - 1);
+                        while (cellGet(d) >= 0) {
+                            let doff = cellGet(d) * 4;
+                            let shd = scopedPtrReadI32Le(psh, doff);
+                            let rcur = cellGet(rem);
+                            let coord = rcur % shd;
+                            cellSet(rem, rcur / shd);
+                            cellSet(od, cellGet(od) + coord * scopedPtrReadI32Le(psd, doff));
+                            cellSet(d, cellGet(d) - 1)
+                        };
+                        let doff2 = cellGet(od) * 4;
+                        let cur = scopedPtrReadF32Le(pd, doff2);
+                        scopedPtrWriteF32Le(pd, doff2, cur + scopedPtrReadF32Le(ps, cellGet(idx) * 4));
+                        cellSet(idx, cellGet(idx) + 1)
+                    }
+                })
+            )
+        )
+    )
+}
+
+// ============================================================================
+// Unary Math & Activations (op: 0=exp, 1=log, 2=sqrt, 3=rsqrt, 4=abs, 5=sq, 6=tanh, 7=sigmoid, 8=round, 9=silu, 10=gelu, 11=relu)
+// ============================================================================
+
+pub def cpuUnaryFwd(op: Int, x: ForeignPtr, out: ForeignPtr, n: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let zero = floatToF32(0.0);
+            let half = floatToF32(0.5);
+            let one = floatToF32(1.0);
+            let gc = floatToF32(0.7978845608);
+            let gk = floatToF32(0.044715);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let off = cellGet(i) * 4;
+                let v = scopedPtrReadF32Le(px, off);
+                let r =
+                    if (op == 0) mathExpF32(v)
+                    else if (op == 1) mathLogF32(v)
+                    else if (op == 2) mathSqrtF32(v)
+                    else if (op == 3) one / mathSqrtF32(v)
+                    else if (op == 4) mathAbsF32(v)
+                    else if (op == 5) v * v
+                    else if (op == 6) mathTanhF32(v)
+                    else if (op == 7) one / (one + mathExpF32(zero - v))
+                    else if (op == 8) (if (v >= zero) mathFloorF32(v + half) else mathCeilF32(v - half))
+                    else if (op == 9) v / (one + mathExpF32(zero - v))
+                    else if (op == 10) half * v * (one + mathTanhF32(gc * (v + gk * v * v * v)))
+                    else (if (v > zero) v else zero);
+                scopedPtrWriteF32Le(po, off, r);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    )
+
+pub def cpuUnaryBwd(op: Int, x: ForeignPtr, y: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, n: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(y, (py) ->
+            withForeignPtr(gy, (pgy) ->
+                withForeignPtr(gx, (pgx) -> {
+                    let zero = floatToF32(0.0);
+                    let half = floatToF32(0.5);
+                    let one = floatToF32(1.0);
+                    let two = floatToF32(2.0);
+                    let eps = floatToF32(1.0e-12);
+                    let gc = floatToF32(0.7978845608);
+                    let gk = floatToF32(0.044715);
+                    let gk3 = floatToF32(0.134145);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n) {
+                        let off = cellGet(i) * 4;
+                        let v = scopedPtrReadF32Le(px, off);
+                        let yv = scopedPtrReadF32Le(py, off);
+                        let g = scopedPtrReadF32Le(pgy, off);
+                        let r =
+                            if (op == 0) g * yv
+                            else if (op == 1) g / v
+                            else if (op == 2) g / (two * yv + eps)
+                            else if (op == 3) (zero - half) * g * yv * yv * yv
+                            else if (op == 4) (if (v > zero) g else if (v < zero) zero - g else zero)
+                            else if (op == 5) two * v * g
+                            else if (op == 6) g * (one - yv * yv)
+                            else if (op == 7) g * yv * (one - yv)
+                            else if (op == 8) zero
+                            else if (op == 9) {
+                                let s = one / (one + mathExpF32(zero - v));
+                                g * s * (one + v * (one - s))
+                            }
+                            else if (op == 10) {
+                                let v2 = v * v;
+                                let th = mathTanhF32(gc * (v + gk * v * v2));
+                                g * (half * (one + th) + half * v * (one - th * th) * gc * (one + gk3 * v2))
+                            }
+                            else (if (v > zero) g else zero);
+                        scopedPtrWriteF32Le(pgx, off, r);
+                        cellSet(i, cellGet(i) + 1)
+                    }
+                })
+            )
+        )
+    )
+
+// ============================================================================
+// Axis Slice, Reductions & Norms
+// ============================================================================
+
+pub def cpuSliceAxisFwd(x: ForeignPtr, out: ForeignPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let o = cellNew(0);
+            while (cellGet(o) < outer) {
+                let oi = cellGet(o);
+                let l = cellNew(0);
+                while (cellGet(l) < len) {
+                    let li = cellGet(l);
+                    let srcBase = (oi * inDim + start + li) * inner;
+                    let dstBase = (oi * len + li) * inner;
+                    let k = cellNew(0);
+                    while (cellGet(k) < inner) {
+                        let ki = cellGet(k);
+                        scopedPtrWriteF32Le(po, (dstBase + ki) * 4, scopedPtrReadF32Le(px, (srcBase + ki) * 4));
+                        cellSet(k, ki + 1)
+                    };
+                    cellSet(l, li + 1)
+                };
+                cellSet(o, oi + 1)
+            }
+        })
+    )
+
+pub def cpuSliceAxisBwd(gy: ForeignPtr, gx: ForeignPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void = {
+    cpuFill(gx, outer * inDim * inner, floatToF32(0.0));
+    withForeignPtr(gy, (pgy) ->
+        withForeignPtr(gx, (pgx) -> {
+            let o = cellNew(0);
+            while (cellGet(o) < outer) {
+                let oi = cellGet(o);
+                let l = cellNew(0);
+                while (cellGet(l) < len) {
+                    let li = cellGet(l);
+                    let srcBase = (oi * len + li) * inner;
+                    let dstBase = (oi * inDim + start + li) * inner;
+                    let k = cellNew(0);
+                    while (cellGet(k) < inner) {
+                        let ki = cellGet(k);
+                        scopedPtrWriteF32Le(pgx, (dstBase + ki) * 4, scopedPtrReadF32Le(pgy, (srcBase + ki) * 4));
+                        cellSet(k, ki + 1)
+                    };
+                    cellSet(l, li + 1)
+                };
+                cellSet(o, oi + 1)
+            }
+        })
+    )
+}
+
+pub def cpuSumAxis(x: ForeignPtr, out: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = {
+    cpuFill(out, outer * inner, floatToF32(0.0));
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let o = cellNew(0);
+            while (cellGet(o) < outer) {
+                let oi = cellGet(o);
+                let outBase = oi * inner;
+                let d = cellNew(0);
+                while (cellGet(d) < dim) {
+                    let xBase = (oi * dim + cellGet(d)) * inner;
+                    let k = cellNew(0);
+                    while (cellGet(k) < inner) {
+                        let ki = cellGet(k);
+                        let ooff = (outBase + ki) * 4;
+                        let cur = scopedPtrReadF32Le(po, ooff);
+                        scopedPtrWriteF32Le(po, ooff, cur + scopedPtrReadF32Le(px, (xBase + ki) * 4));
+                        cellSet(k, ki + 1)
+                    };
+                    cellSet(d, cellGet(d) + 1)
+                };
+                cellSet(o, oi + 1)
+            }
+        })
+    )
+}
+
+pub def cpuMaxAxis(x: ForeignPtr, out: ForeignPtr, outer: Int, dim: Int, inner: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let o = cellNew(0);
+            while (cellGet(o) < outer) {
+                let oi = cellGet(o);
+                let outBase = oi * inner;
+                let x0Base = (oi * dim) * inner;
+                let k0 = cellNew(0);
+                while (cellGet(k0) < inner) {
+                    let ki = cellGet(k0);
+                    scopedPtrWriteF32Le(po, (outBase + ki) * 4, scopedPtrReadF32Le(px, (x0Base + ki) * 4));
+                    cellSet(k0, ki + 1)
+                };
+                let d = cellNew(1);
+                while (cellGet(d) < dim) {
+                    let xBase = (oi * dim + cellGet(d)) * inner;
+                    let k = cellNew(0);
+                    while (cellGet(k) < inner) {
+                        let ki = cellGet(k);
+                        let ooff = (outBase + ki) * 4;
+                        let v = scopedPtrReadF32Le(px, (xBase + ki) * 4);
+                        if (v > scopedPtrReadF32Le(po, ooff)) scopedPtrWriteF32Le(po, ooff, v) else ();
+                        cellSet(k, ki + 1)
+                    };
+                    cellSet(d, cellGet(d) + 1)
+                };
+                cellSet(o, oi + 1)
+            }
+        })
+    )
+
+pub def cpuSumAll(x: ForeignPtr, n: Int): Float =
+    withForeignPtr(x, (px) -> {
+        let acc = cellNew(0.0);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            cellSet(acc, cellGet(acc) + f32ToFloat(scopedPtrReadF32Le(px, cellGet(i) * 4)));
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(acc)
+    })
+
+pub def cpuSumSq(x: ForeignPtr, n: Int): Float =
+    withForeignPtr(x, (px) -> {
+        let acc = cellNew(0.0);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let v = f32ToFloat(scopedPtrReadF32Le(px, cellGet(i) * 4));
+            cellSet(acc, cellGet(acc) + v * v);
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(acc)
+    })
+
+pub def cpuRmsNormFwd(x: ForeignPtr, w: ForeignPtr, out: ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(w, (pw) ->
+            withForeignPtr(out, (po) -> {
+                let dimF = intToFloat(dim);
+                let one = floatToF32(1.0);
+                let r = cellNew(0);
+                while (cellGet(r) < rows) {
+                    let base = cellGet(r) * dim;
+                    let ss = cellNew(0.0);
+                    let c = cellNew(0);
+                    while (cellGet(c) < dim) {
+                        let v = f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c)) * 4));
+                        cellSet(ss, cellGet(ss) + v * v);
+                        cellSet(c, cellGet(c) + 1)
+                    };
+                    let invRms = one / mathSqrtF32(floatToF32(cellGet(ss) / dimF + eps));
+                    let c2 = cellNew(0);
+                    while (cellGet(c2) < dim) {
+                        let ci = cellGet(c2);
+                        let off = (base + ci) * 4;
+                        let xv = scopedPtrReadF32Le(px, off);
+                        let wv = scopedPtrReadF32Le(pw, ci * 4);
+                        scopedPtrWriteF32Le(po, off, xv * invRms * wv);
+                        cellSet(c2, ci + 1)
+                    };
+                    cellSet(r, cellGet(r) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuRmsNormBwd(x: ForeignPtr, w: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, gw: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = {
+    cpuFill(gw, dim, floatToF32(0.0));
+    withForeignPtr(x, (px) ->
+        withForeignPtr(w, (pw) ->
+            withForeignPtr(gy, (pgy) ->
+                withForeignPtr(gx, (pgx) ->
+                    withForeignPtr(gw, (pgw) -> {
+                        let dimF = intToFloat(dim);
+                        let dimF32 = intToF32(dim);
+                        let one = floatToF32(1.0);
+                        let r = cellNew(0);
+                        while (cellGet(r) < rows) {
+                            let base = cellGet(r) * dim;
+                            let ss = cellNew(0.0);
+                            let c = cellNew(0);
+                            while (cellGet(c) < dim) {
+                                let v = f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c)) * 4));
+                                cellSet(ss, cellGet(ss) + v * v);
+                                cellSet(c, cellGet(c) + 1)
+                            };
+                            let invRms = one / mathSqrtF32(floatToF32(cellGet(ss) / dimF + eps));
+                            let dot = cellNew(0.0);
+                            let c2 = cellNew(0);
+                            while (cellGet(c2) < dim) {
+                                let ci = cellGet(c2);
+                                let off = (base + ci) * 4;
+                                let xv = scopedPtrReadF32Le(px, off);
+                                let wv = scopedPtrReadF32Le(pw, ci * 4);
+                                let gv = scopedPtrReadF32Le(pgy, off);
+                                let gwOld = scopedPtrReadF32Le(pgw, ci * 4);
+                                scopedPtrWriteF32Le(pgw, ci * 4, gwOld + gv * xv * invRms);
+                                cellSet(dot, cellGet(dot) + f32ToFloat(gv * wv * xv));
+                                cellSet(c2, ci + 1)
+                            };
+                            let coeff = floatToF32(cellGet(dot)) * (invRms * invRms * invRms) / dimF32;
+                            let c3 = cellNew(0);
+                            while (cellGet(c3) < dim) {
+                                let ci = cellGet(c3);
+                                let off = (base + ci) * 4;
+                                let xv = scopedPtrReadF32Le(px, off);
+                                let wv = scopedPtrReadF32Le(pw, ci * 4);
+                                let gv = scopedPtrReadF32Le(pgy, off);
+                                scopedPtrWriteF32Le(pgx, off, gv * wv * invRms - xv * coeff);
+                                cellSet(c3, ci + 1)
+                            };
+                            cellSet(r, cellGet(r) + 1)
+                        }
+                    })
+                )
+            )
+        )
+    )
+}
+
+pub def cpuLayerNormFwd(x: ForeignPtr, w: ForeignPtr, b: ForeignPtr, out: ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(w, (pw) ->
+            withForeignPtr(b, (pb) ->
+                withForeignPtr(out, (po) -> {
+                    let dimF = intToFloat(dim);
+                    let one = floatToF32(1.0);
+                    let r = cellNew(0);
+                    while (cellGet(r) < rows) {
+                        let base = cellGet(r) * dim;
+                        let mean = cellNew(0.0);
+                        let c = cellNew(0);
+                        while (cellGet(c) < dim) {
+                            cellSet(mean, cellGet(mean) + f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c)) * 4)));
+                            cellSet(c, cellGet(c) + 1)
+                        };
+                        let mu = cellGet(mean) / dimF;
+                        let varAcc = cellNew(0.0);
+                        let c2 = cellNew(0);
+                        while (cellGet(c2) < dim) {
+                            let d = f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c2)) * 4)) - mu;
+                            cellSet(varAcc, cellGet(varAcc) + d * d);
+                            cellSet(c2, cellGet(c2) + 1)
+                        };
+                        let invStd = one / mathSqrtF32(floatToF32(cellGet(varAcc) / dimF + eps));
+                        let mu32 = floatToF32(mu);
+                        let c3 = cellNew(0);
+                        while (cellGet(c3) < dim) {
+                            let ci = cellGet(c3);
+                            let off = (base + ci) * 4;
+                            let xh = (scopedPtrReadF32Le(px, off) - mu32) * invStd;
+                            scopedPtrWriteF32Le(po, off, xh * scopedPtrReadF32Le(pw, ci * 4) + scopedPtrReadF32Le(pb, ci * 4));
+                            cellSet(c3, ci + 1)
+                        };
+                        cellSet(r, cellGet(r) + 1)
+                    }
+                })
+            )
+        )
+    )
+
+pub def cpuLayerNormBwd(x: ForeignPtr, w: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, gw: ForeignPtr, gb: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = {
+    cpuFill(gw, dim, floatToF32(0.0));
+    cpuFill(gb, dim, floatToF32(0.0));
+    withForeignPtr(x, (px) ->
+        withForeignPtr(w, (pw) ->
+            withForeignPtr(gy, (pgy) ->
+                withForeignPtr(gx, (pgx) ->
+                    withForeignPtr(gw, (pgw) ->
+                        withForeignPtr(gb, (pgb) -> {
+                            let dimF = intToFloat(dim);
+                            let invD = floatToF32(1.0 / dimF);
+                            let one = floatToF32(1.0);
+                            let r = cellNew(0);
+                            while (cellGet(r) < rows) {
+                                let base = cellGet(r) * dim;
+                                let mean = cellNew(0.0);
+                                let c = cellNew(0);
+                                while (cellGet(c) < dim) {
+                                    cellSet(mean, cellGet(mean) + f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c)) * 4)));
+                                    cellSet(c, cellGet(c) + 1)
+                                };
+                                let mu = cellGet(mean) / dimF;
+                                let varAcc = cellNew(0.0);
+                                let c2 = cellNew(0);
+                                while (cellGet(c2) < dim) {
+                                    let d = f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c2)) * 4)) - mu;
+                                    cellSet(varAcc, cellGet(varAcc) + d * d);
+                                    cellSet(c2, cellGet(c2) + 1)
+                                };
+                                let invStd = one / mathSqrtF32(floatToF32(cellGet(varAcc) / dimF + eps));
+                                let mu32 = floatToF32(mu);
+                                let s1 = cellNew(0.0);
+                                let s2 = cellNew(0.0);
+                                let c3 = cellNew(0);
+                                while (cellGet(c3) < dim) {
+                                    let ci = cellGet(c3);
+                                    let off = (base + ci) * 4;
+                                    let xh = (scopedPtrReadF32Le(px, off) - mu32) * invStd;
+                                    let gv = scopedPtrReadF32Le(pgy, off);
+                                    scopedPtrWriteF32Le(pgw, ci * 4, scopedPtrReadF32Le(pgw, ci * 4) + gv * xh);
+                                    scopedPtrWriteF32Le(pgb, ci * 4, scopedPtrReadF32Le(pgb, ci * 4) + gv);
+                                    let dxh = gv * scopedPtrReadF32Le(pw, ci * 4);
+                                    cellSet(s1, cellGet(s1) + f32ToFloat(dxh));
+                                    cellSet(s2, cellGet(s2) + f32ToFloat(dxh * xh));
+                                    cellSet(c3, ci + 1)
+                                };
+                                let s1f = floatToF32(cellGet(s1));
+                                let s2f = floatToF32(cellGet(s2));
+                                let c4 = cellNew(0);
+                                while (cellGet(c4) < dim) {
+                                    let ci = cellGet(c4);
+                                    let off = (base + ci) * 4;
+                                    let xh = (scopedPtrReadF32Le(px, off) - mu32) * invStd;
+                                    let dxh = scopedPtrReadF32Le(pgy, off) * scopedPtrReadF32Le(pw, ci * 4);
+                                    scopedPtrWriteF32Le(pgx, off, invStd * (dxh - invD * (s1f + xh * s2f)));
+                                    cellSet(c4, ci + 1)
+                                };
+                                cellSet(r, cellGet(r) + 1)
+                            }
+                        })
+                    )
+                )
+            )
+        )
+    )
+}
+
+pub def cpuL2NormLastFwd(x: ForeignPtr, out: ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let eps32 = floatToF32(eps);
+            let one = floatToF32(1.0);
+            let r = cellNew(0);
+            while (cellGet(r) < rows) {
+                let base = cellGet(r) * dim;
+                let ss = cellNew(0.0);
+                let c = cellNew(0);
+                while (cellGet(c) < dim) {
+                    let v = f32ToFloat(scopedPtrReadF32Le(px, (base + cellGet(c)) * 4));
+                    cellSet(ss, cellGet(ss) + v * v);
+                    cellSet(c, cellGet(c) + 1)
+                };
+                let norm = mathSqrtF32(floatToF32(cellGet(ss)));
+                let inv = one / (if (norm > eps32) norm else eps32);
+                let c2 = cellNew(0);
+                while (cellGet(c2) < dim) {
+                    let off = (base + cellGet(c2)) * 4;
+                    scopedPtrWriteF32Le(po, off, scopedPtrReadF32Le(px, off) * inv);
+                    cellSet(c2, cellGet(c2) + 1)
+                };
+                cellSet(r, cellGet(r) + 1)
+            }
+        })
+    )
+
+pub def cpuL2NormLastBwd(x: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, dim: Int, eps: Float): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let eps32 = floatToF32(eps);
+                let one = floatToF32(1.0);
+                let r = cellNew(0);
+                while (cellGet(r) < rows) {
+                    let base = cellGet(r) * dim;
+                    let ss = cellNew(0.0);
+                    let dot = cellNew(0.0);
+                    let c = cellNew(0);
+                    while (cellGet(c) < dim) {
+                        let off = (base + cellGet(c)) * 4;
+                        let xv = f32ToFloat(scopedPtrReadF32Le(px, off));
+                        let gv = f32ToFloat(scopedPtrReadF32Le(pgy, off));
+                        cellSet(ss, cellGet(ss) + xv * xv);
+                        cellSet(dot, cellGet(dot) + xv * gv);
+                        cellSet(c, cellGet(c) + 1)
+                    };
+                    let norm = mathSqrtF32(floatToF32(cellGet(ss)));
+                    let inv = one / (if (norm > eps32) norm else eps32);
+                    let coeff = if (norm > eps32) floatToF32(cellGet(dot)) * inv * inv * inv else floatToF32(0.0);
+                    let c2 = cellNew(0);
+                    while (cellGet(c2) < dim) {
+                        let off = (base + cellGet(c2)) * 4;
+                        let xv = scopedPtrReadF32Le(px, off);
+                        let gv = scopedPtrReadF32Le(pgy, off);
+                        scopedPtrWriteF32Le(pgx, off, gv * inv - xv * coeff);
+                        cellSet(c2, cellGet(c2) + 1)
+                    };
+                    cellSet(r, cellGet(r) + 1)
+                }
+            })
+        )
+    )
+
+// ============================================================================
+// Softmax, LogSumExp, CrossEntropy, Embedding, RoPE, Transpose, Causal Mask
+// ============================================================================
+
+pub def cpuSoftmaxFwd(x: ForeignPtr, out: ForeignPtr, rows: Int, cols: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let r = cellNew(0);
+            while (cellGet(r) < rows) {
+                let base = cellGet(r) * cols;
+                let mx = cellNew(scopedPtrReadF32Le(px, base * 4));
+                let c = cellNew(1);
+                while (cellGet(c) < cols) {
+                    let v = scopedPtrReadF32Le(px, (base + cellGet(c)) * 4);
+                    if (v > cellGet(mx)) cellSet(mx, v) else ();
+                    cellSet(c, cellGet(c) + 1)
+                };
+                let m = cellGet(mx);
+                let sum = cellNew(0.0);
+                let c2 = cellNew(0);
+                while (cellGet(c2) < cols) {
+                    let off = (base + cellGet(c2)) * 4;
+                    let e = mathExpF32(scopedPtrReadF32Le(px, off) - m);
+                    scopedPtrWriteF32Le(po, off, e);
+                    cellSet(sum, cellGet(sum) + f32ToFloat(e));
+                    cellSet(c2, cellGet(c2) + 1)
+                };
+                let inv = floatToF32(1.0 / cellGet(sum));
+                let c3 = cellNew(0);
+                while (cellGet(c3) < cols) {
+                    let off = (base + cellGet(c3)) * 4;
+                    scopedPtrWriteF32Le(po, off, scopedPtrReadF32Le(po, off) * inv);
+                    cellSet(c3, cellGet(c3) + 1)
+                };
+                cellSet(r, cellGet(r) + 1)
+            }
+        })
+    )
+
+pub def cpuSoftmaxBwd(y: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void =
+    withForeignPtr(y, (py) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let r = cellNew(0);
+                while (cellGet(r) < rows) {
+                    let base = cellGet(r) * cols;
+                    let dot = cellNew(0.0);
+                    let c = cellNew(0);
+                    while (cellGet(c) < cols) {
+                        let off = (base + cellGet(c)) * 4;
+                        cellSet(dot, cellGet(dot) + f32ToFloat(scopedPtrReadF32Le(py, off)) * f32ToFloat(scopedPtrReadF32Le(pgy, off)));
+                        cellSet(c, cellGet(c) + 1)
+                    };
+                    let d = floatToF32(cellGet(dot));
+                    let c2 = cellNew(0);
+                    while (cellGet(c2) < cols) {
+                        let off = (base + cellGet(c2)) * 4;
+                        scopedPtrWriteF32Le(pgx, off, scopedPtrReadF32Le(py, off) * (scopedPtrReadF32Le(pgy, off) - d));
+                        cellSet(c2, cellGet(c2) + 1)
+                    };
+                    cellSet(r, cellGet(r) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuLogSumExpFwd(x: ForeignPtr, out: ForeignPtr, rows: Int, cols: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let r = cellNew(0);
+            while (cellGet(r) < rows) {
+                let base = cellGet(r) * cols;
+                let mx = cellNew(scopedPtrReadF32Le(px, base * 4));
+                let c = cellNew(1);
+                while (cellGet(c) < cols) {
+                    let v = scopedPtrReadF32Le(px, (base + cellGet(c)) * 4);
+                    if (v > cellGet(mx)) cellSet(mx, v) else ();
+                    cellSet(c, cellGet(c) + 1)
+                };
+                let m = cellGet(mx);
+                let sum = cellNew(0.0);
+                let c2 = cellNew(0);
+                while (cellGet(c2) < cols) {
+                    let e = mathExpF32(scopedPtrReadF32Le(px, (base + cellGet(c2)) * 4) - m);
+                    cellSet(sum, cellGet(sum) + f32ToFloat(e));
+                    cellSet(c2, cellGet(c2) + 1)
+                };
+                scopedPtrWriteF32Le(po, cellGet(r) * 4, m + mathLogF32(floatToF32(cellGet(sum))));
+                cellSet(r, cellGet(r) + 1)
+            }
+        })
+    )
+
+pub def cpuLogSumExpBwd(x: ForeignPtr, lse: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(lse, (pl) ->
+            withForeignPtr(gy, (pgy) ->
+                withForeignPtr(gx, (pgx) -> {
+                    let r = cellNew(0);
+                    while (cellGet(r) < rows) {
+                        let base = cellGet(r) * cols;
+                        let lr = scopedPtrReadF32Le(pl, cellGet(r) * 4);
+                        let g = scopedPtrReadF32Le(pgy, cellGet(r) * 4);
+                        let c = cellNew(0);
+                        while (cellGet(c) < cols) {
+                            let off = (base + cellGet(c)) * 4;
+                            scopedPtrWriteF32Le(pgx, off, g * mathExpF32(scopedPtrReadF32Le(px, off) - lr));
+                            cellSet(c, cellGet(c) + 1)
+                        };
+                        cellSet(r, cellGet(r) + 1)
+                    }
+                })
+            )
+        )
+    )
+
+pub def cpuCrossEntropyFwd(logits: ForeignPtr, targets: ForeignPtr, probs: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float = {
+    cpuSoftmaxFwd(logits, probs, rows, vocab);
+    withForeignPtr(probs, (pp) ->
+        withForeignPtr(targets, (pt) -> {
+            let loss = cellNew(0.0);
+            let valid = cellNew(0);
+            let eps = floatToF32(1.0e-12);
+            let r = cellNew(0);
+            while (cellGet(r) < rows) {
+                let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
+                if (tgt != ignoreIdx && tgt >= 0 && tgt < vocab) {
+                    let p = scopedPtrReadF32Le(pp, (cellGet(r) * vocab + tgt) * 4);
+                    cellSet(loss, cellGet(loss) - f32ToFloat(mathLogF32(p + eps)));
+                    cellSet(valid, cellGet(valid) + 1)
+                } else ();
+                cellSet(r, cellGet(r) + 1)
+            };
+            if (cellGet(valid) > 0) cellGet(loss) / intToFloat(cellGet(valid)) else 0.0
+        })
+    )
+}
+
+pub def cpuCrossEntropyBwd(probs: ForeignPtr, targets: ForeignPtr, gLoss: Float, gLogits: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void = {
+    let valid = withForeignPtr(targets, (pt) -> {
+        let cnt = cellNew(0);
+        let r = cellNew(0);
+        while (cellGet(r) < rows) {
+            let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
+            if (tgt != ignoreIdx && tgt >= 0 && tgt < vocab) cellSet(cnt, cellGet(cnt) + 1) else ();
+            cellSet(r, cellGet(r) + 1)
+        };
+        cellGet(cnt)
+    });
+    if (valid <= 0) {
+        cpuFill(gLogits, rows * vocab, floatToF32(0.0))
+    } else {
+        let sc = floatToF32(gLoss / intToFloat(valid));
+        let zero = floatToF32(0.0);
+        withForeignPtr(probs, (pp) ->
+            withForeignPtr(targets, (pt) ->
+                withForeignPtr(gLogits, (pg) -> {
+                    let r = cellNew(0);
+                    while (cellGet(r) < rows) {
+                        let base = cellGet(r) * vocab;
+                        let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
+                        if (tgt == ignoreIdx || tgt < 0 || tgt >= vocab) {
+                            let c = cellNew(0);
+                            while (cellGet(c) < vocab) {
+                                scopedPtrWriteF32Le(pg, (base + cellGet(c)) * 4, zero);
+                                cellSet(c, cellGet(c) + 1)
+                            }
+                        } else {
+                            let c = cellNew(0);
+                            while (cellGet(c) < vocab) {
+                                let off = (base + cellGet(c)) * 4;
+                                scopedPtrWriteF32Le(pg, off, scopedPtrReadF32Le(pp, off) * sc);
+                                cellSet(c, cellGet(c) + 1)
+                            };
+                            let toff = (base + tgt) * 4;
+                            scopedPtrWriteF32Le(pg, toff, scopedPtrReadF32Le(pg, toff) - sc)
+                        };
+                        cellSet(r, cellGet(r) + 1)
+                    }
+                })
+            )
+        )
+    }
+}
+
+pub def cpuEmbeddingFwd(table: ForeignPtr, ids: ForeignPtr, out: ForeignPtr, nIds: Int, dim: Int): Void =
+    withForeignPtr(table, (pt) ->
+        withForeignPtr(ids, (pi) ->
+            withForeignPtr(out, (po) -> {
+                let i = cellNew(0);
+                while (cellGet(i) < nIds) {
+                    let id = scopedPtrReadI32Le(pi, cellGet(i) * 4);
+                    let srcBase = id * dim;
+                    let dstBase = cellGet(i) * dim;
+                    let c = cellNew(0);
+                    while (cellGet(c) < dim) {
+                        let ci = cellGet(c);
+                        scopedPtrWriteF32Le(po, (dstBase + ci) * 4, scopedPtrReadF32Le(pt, (srcBase + ci) * 4));
+                        cellSet(c, ci + 1)
+                    };
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+
+pub def cpuEmbeddingBwd(ids: ForeignPtr, gy: ForeignPtr, gTable: ForeignPtr, nIds: Int, vocab: Int, dim: Int): Void = {
+    cpuFill(gTable, vocab * dim, floatToF32(0.0));
+    withForeignPtr(ids, (pi) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gTable, (pgt) -> {
+                let i = cellNew(0);
+                while (cellGet(i) < nIds) {
+                    let id = scopedPtrReadI32Le(pi, cellGet(i) * 4);
+                    if (id >= 0 && id < vocab) {
+                        let srcBase = cellGet(i) * dim;
+                        let dstBase = id * dim;
+                        let c = cellNew(0);
+                        while (cellGet(c) < dim) {
+                            let ci = cellGet(c);
+                            let doff = (dstBase + ci) * 4;
+                            let cur = scopedPtrReadF32Le(pgt, doff);
+                            scopedPtrWriteF32Le(pgt, doff, cur + scopedPtrReadF32Le(pgy, (srcBase + ci) * 4));
+                            cellSet(c, ci + 1)
+                        }
+                    } else ();
+                    cellSet(i, cellGet(i) + 1)
+                }
+            })
+        )
+    )
+}
+
+pub def cpuRope(x: ForeignPtr, out: ForeignPtr, batch: Int, seq: Int, heads: Int, headDim: Int, theta: Float, isBwd: Bool): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let half = headDim / 2;
+            let th32 = floatToF32(theta);
+            let hd32 = intToF32(headDim);
+            let b = cellNew(0);
+            while (cellGet(b) < batch) {
+                let t = cellNew(0);
+                while (cellGet(t) < seq) {
+                    let tf = intToF32(cellGet(t));
+                    let h = cellNew(0);
+                    while (cellGet(h) < heads) {
+                        let base = ((cellGet(b) * seq + cellGet(t)) * heads + cellGet(h)) * headDim;
+                        let i = cellNew(0);
+                        while (cellGet(i) < half) {
+                            let ii = cellGet(i);
+                            let expArg = intToF32(2 * ii) / hd32;
+                            let ang = tf / mathPowF32(th32, expArg);
+                            let cs = mathCosF32(ang);
+                            let sn = mathSinF32(ang);
+                            let off0 = (base + ii) * 4;
+                            let off1 = (base + half + ii) * 4;
+                            let v0 = scopedPtrReadF32Le(px, off0);
+                            let v1 = scopedPtrReadF32Le(px, off1);
+                            if (isBwd) {
+                                scopedPtrWriteF32Le(po, off0, v0 * cs + v1 * sn);
+                                scopedPtrWriteF32Le(po, off1, v1 * cs - v0 * sn)
+                            } else {
+                                scopedPtrWriteF32Le(po, off0, v0 * cs - v1 * sn);
+                                scopedPtrWriteF32Le(po, off1, v0 * sn + v1 * cs)
+                            };
+                            cellSet(i, ii + 1)
+                        };
+                        cellSet(h, cellGet(h) + 1)
+                    };
+                    cellSet(t, cellGet(t) + 1)
+                };
+                cellSet(b, cellGet(b) + 1)
+            }
+        })
+    )
+
+pub def cpuTranspose2d(x: ForeignPtr, out: ForeignPtr, rows: Int, cols: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let r = cellNew(0);
+            while (cellGet(r) < rows) {
+                let ri = cellGet(r);
+                let c = cellNew(0);
+                while (cellGet(c) < cols) {
+                    let ci = cellGet(c);
+                    scopedPtrWriteF32Le(po, (ci * rows + ri) * 4, scopedPtrReadF32Le(px, (ri * cols + ci) * 4));
+                    cellSet(c, ci + 1)
+                };
+                cellSet(r, ri + 1)
+            }
+        })
+    )
+
+pub def cpuTranspose0213(x: ForeignPtr, out: ForeignPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void =
+    withForeignPtr(x, (px) ->
+        withForeignPtr(out, (po) -> {
+            let i0 = cellNew(0);
+            while (cellGet(i0) < d0) {
+                let i1 = cellNew(0);
+                while (cellGet(i1) < d1) {
+                    let i2 = cellNew(0);
+                    while (cellGet(i2) < d2) {
+                        let srcBase = ((cellGet(i0) * d1 + cellGet(i1)) * d2 + cellGet(i2)) * d3;
+                        let dstBase = ((cellGet(i0) * d2 + cellGet(i2)) * d1 + cellGet(i1)) * d3;
+                        let i3 = cellNew(0);
+                        while (cellGet(i3) < d3) {
+                            let k = cellGet(i3);
+                            scopedPtrWriteF32Le(po, (dstBase + k) * 4, scopedPtrReadF32Le(px, (srcBase + k) * 4));
+                            cellSet(i3, k + 1)
+                        };
+                        cellSet(i2, cellGet(i2) + 1)
+                    };
+                    cellSet(i1, cellGet(i1) + 1)
+                };
+                cellSet(i0, cellGet(i0) + 1)
+            }
+        })
+    )
+
+pub def cpuCausalMaskAdd(scores: ForeignPtr, bh: Int, seq: Int): Void =
+    withForeignPtr(scores, (ps) -> {
+        let negInf = floatToF32(-1.0e9);
+        let b = cellNew(0);
+        while (cellGet(b) < bh) {
+            let base = cellGet(b) * seq * seq;
+            let i = cellNew(0);
+            while (cellGet(i) < seq) {
+                let j = cellNew(cellGet(i) + 1);
+                while (cellGet(j) < seq) {
+                    let off = (base + cellGet(i) * seq + cellGet(j)) * 4;
+                    scopedPtrWriteF32Le(ps, off, scopedPtrReadF32Le(ps, off) + negInf);
+                    cellSet(j, cellGet(j) + 1)
+                };
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellSet(b, cellGet(b) + 1)
+        }
+    })
+
+// ============================================================================
+// Pure-Geisha Deterministic PRNG (Box-Muller) & Fused AdamW
+// ============================================================================
+
+pub def cpuRandn(dst: ForeignPtr, n: Int, seed: Int64, std: Float): Void =
+    withForeignPtr(dst, (pd) -> {
+        let st = cellNew(seed * intToI64(1664525) + intToI64(1013904223));
+        let mask31 = intToI64(2147483647);
+        let inv = 1.0 / 2147483648.0;
+        let twoPi = floatToF32(6.28318530718);
+        let negTwo = floatToF32(-2.0);
+        let std32 = floatToF32(std);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let s1 = cellGet(st) * intToI64(1664525) + intToI64(1013904223);
+            let s2 = s1 * intToI64(1664525) + intToI64(1013904223);
+            cellSet(st, s2);
+            let u1 = floatToF32((intToFloat(i64ToInt((s1 >> 16) & mask31)) + 1.0) * inv);
+            let u2 = floatToF32((intToFloat(i64ToInt((s2 >> 16) & mask31))) * inv);
+            let r = mathSqrtF32(negTwo * mathLogF32(u1));
+            let phi = twoPi * u2;
+            let idx = cellGet(i);
+            scopedPtrWriteF32Le(pd, idx * 4, r * mathCosF32(phi) * std32);
+            if (idx + 1 < n) {
+                scopedPtrWriteF32Le(pd, (idx + 1) * 4, r * mathSinF32(phi) * std32)
+            } else ();
+            cellSet(i, idx + 2)
+        }
+    })
+
+pub def cpuAdamwStep(
+    p: ForeignPtr, g: ForeignPtr, m: ForeignPtr, v: ForeignPtr,
+    pOut: ForeignPtr, mOut: ForeignPtr, vOut: ForeignPtr,
+    n: Int, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
+): Void =
+    withForeignPtr(p, (pp) ->
+        withForeignPtr(g, (pg) ->
+            withForeignPtr(m, (pm) ->
+                withForeignPtr(v, (pv) ->
+                    withForeignPtr(pOut, (ppo) ->
+                        withForeignPtr(mOut, (pmo) ->
+                            withForeignPtr(vOut, (pvo) -> {
+                                let one = floatToF32(1.0);
+                                let omb1 = one - b1;
+                                let omb2 = one - b2;
+                                let decay = one - lr * wd;
+                                let i = cellNew(0);
+                                while (cellGet(i) < n) {
+                                    let off = cellGet(i) * 4;
+                                    let gi = scopedPtrReadF32Le(pg, off);
+                                    let mi = b1 * scopedPtrReadF32Le(pm, off) + omb1 * gi;
+                                    let vi = b2 * scopedPtrReadF32Le(pv, off) + omb2 * gi * gi;
+                                    scopedPtrWriteF32Le(pmo, off, mi);
+                                    scopedPtrWriteF32Le(pvo, off, vi);
+                                    let pi = scopedPtrReadF32Le(pp, off);
+                                    let upd = (mi / bc1) / (mathSqrtF32(vi / bc2) + eps);
+                                    scopedPtrWriteF32Le(ppo, off, pi * decay - lr * upd);
+                                    cellSet(i, cellGet(i) + 1)
+                                }
+                            })
+                        )
+                    )
+                )
+            )
+        )
+    )
