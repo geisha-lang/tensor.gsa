@@ -278,6 +278,37 @@ __global__ void k_adamw(const float *p, const float *g, const float *m, const fl
     if (i < n) { float gi = g[i], mi = b1 * m[i] + (1.0f - b1) * gi, vi = b2 * v[i] + (1.0f - b2) * gi * gi; mo[i] = mi; vo[i] = vi; po[i] = p[i] * (1.0f - lr * wd) - lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps)); }
 }
 
+typedef struct {
+    const float *p, *g, *m, *v;
+    float *po, *mo, *vo;
+    int64_t n;
+    int64_t block_start;
+} AdamwParamDesc;
+
+// Single-launch multi-tensor fused AdamW across all model parameters
+__global__ void k_adamw_multi(
+    const AdamwParamDesc *descs, int32_t count,
+    float lr, float b1, float b2, float eps, float wd, float bc1, float bc2
+) {
+    int64_t blk = (int64_t)blockIdx.x;
+    int32_t lo = 0, hi = count - 1;
+    while (lo < hi) {
+        int32_t mid = (lo + hi + 1) >> 1;
+        if (descs[mid].block_start <= blk) lo = mid;
+        else hi = mid - 1;
+    }
+    const AdamwParamDesc d = descs[lo];
+    int64_t i = (blk - d.block_start) * 256LL + (int64_t)threadIdx.x;
+    if (i < d.n) {
+        float gi = d.g[i];
+        float mi = b1 * d.m[i] + (1.0f - b1) * gi;
+        float vi = b2 * d.v[i] + (1.0f - b2) * gi * gi;
+        d.mo[i] = mi;
+        d.vo[i] = vi;
+        d.po[i] = d.p[i] * (1.0f - lr * wd) - lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps));
+    }
+}
+
 static void cu_fill(int32_t d, float *dst, int64_t n, float v) { cudaSetDevice(d); k_fill<<<grid1d(n), 256>>>(dst, n, v); }
 static void cu_copy(int32_t d, float *dst, const float *src, int64_t n) { cu_d2d(d, dst, src, n * (int64_t)sizeof(float)); }
 static void cu_add(int32_t d, const float *a, const float *b, float *o, int64_t n) { cudaSetDevice(d); k_add<<<grid1d(n), 256>>>(a, b, o, n); }
@@ -356,6 +387,43 @@ static void cu_causal(int32_t d, float *s, int32_t bh, int32_t seq) { cudaSetDev
 static void cu_randn(int32_t d, float *dst, int64_t n, int64_t seed, float std) { float *h = (float *)malloc((size_t)n * sizeof(float)); gs_backend_cpu.randn(0, h, n, seed, std); cu_h2d(d, dst, h, n * (int64_t)sizeof(float)); free(h); }
 static void cu_adamw(int32_t d, const float *p, const float *g, const float *m, const float *v, float *po, float *mo, float *vo, int64_t n, float lr, float b1, float b2, float eps, float wd, float bc1, float bc2) { cudaSetDevice(d); k_adamw<<<grid1d(n), 256>>>(p, g, m, v, po, mo, vo, n, lr, b1, b2, eps, wd, bc1, bc2); }
 
+static void cu_adamw_multi(
+    int32_t d, int32_t count,
+    const float *const *ps, const float *const *gs,
+    const float *const *ms, const float *const *vs,
+    float *const *p_outs, float *const *m_outs, float *const *v_outs,
+    const int64_t *numels,
+    float lr, float b1, float b2, float eps, float wd, float bc1, float bc2
+) {
+    if (count <= 0) return;
+    AdamwParamDesc *h_descs = (AdamwParamDesc *)malloc((size_t)count * sizeof(AdamwParamDesc));
+    if (!h_descs) return;
+    int64_t total_blocks = 0;
+    for (int32_t t = 0; t < count; t++) {
+        h_descs[t].p = ps[t];
+        h_descs[t].g = gs[t];
+        h_descs[t].m = ms[t];
+        h_descs[t].v = vs[t];
+        h_descs[t].po = p_outs[t];
+        h_descs[t].mo = m_outs[t];
+        h_descs[t].vo = v_outs[t];
+        h_descs[t].n = numels[t];
+        h_descs[t].block_start = total_blocks;
+        total_blocks += (numels[t] + 255) / 256;
+    }
+    if (total_blocks > 0) {
+        cudaSetDevice(d);
+        AdamwParamDesc *d_descs = NULL;
+        size_t bytes = (size_t)count * sizeof(AdamwParamDesc);
+        if (cudaMalloc(&d_descs, bytes) == cudaSuccess) {
+            cudaMemcpy(d_descs, h_descs, bytes, cudaMemcpyHostToDevice);
+            k_adamw_multi<<<(int)total_blocks, 256>>>(d_descs, count, lr, b1, b2, eps, wd, bc1, bc2);
+            cudaFree(d_descs);
+        }
+    }
+    free(h_descs);
+}
+
 const GsTensorBackend gs_backend_cuda = {
     .name = "cuda+cublas", .dev_kind = GS_DEV_CUDA, .device_count = cu_device_count,
     .alloc = cu_alloc, .free_ptr = cu_free, .copy_h2d = cu_h2d, .copy_d2h = cu_d2h, .copy_d2d = cu_d2d,
@@ -373,7 +441,7 @@ const GsTensorBackend gs_backend_cuda = {
     .cross_entropy_fwd = cu_ce_f, .cross_entropy_bwd = cu_ce_b,
     .embedding_fwd = cu_emb_f, .embedding_bwd = cu_emb_b, .rope_fwd = cu_rope_f, .rope_bwd = cu_rope_b,
     .transpose_2d = cu_t2d, .transpose_0213 = cu_t0213, .causal_mask_add = cu_causal,
-    .randn = cu_randn, .adamw_step = cu_adamw,
+    .randn = cu_randn, .adamw_step = cu_adamw, .adamw_multi_step = cu_adamw_multi,
 };
 
 #endif // GS_TENSOR_CUDA

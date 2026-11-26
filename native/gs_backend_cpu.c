@@ -699,6 +699,23 @@ static void cpu_adamw_step(
     }
 }
 
+static void cpu_adamw_multi_step(
+    int32_t dev_id, int32_t count,
+    const float *const *ps, const float *const *gs,
+    const float *const *ms, const float *const *vs,
+    float *const *p_outs, float *const *m_outs, float *const *v_outs,
+    const int64_t *numels,
+    float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2
+) {
+    for (int32_t t = 0; t < count; t++) {
+        cpu_adamw_step(
+            dev_id, ps[t], gs[t], ms[t], vs[t],
+            p_outs[t], m_outs[t], v_outs[t],
+            numels[t], lr, beta1, beta2, eps, wd, bc1, bc2
+        );
+    }
+}
+
 const GsTensorBackend gs_backend_cpu = {
 #if defined(__APPLE__) && !defined(GS_TENSOR_NO_ACCELERATE)
     .name = "cpu+accelerate",
@@ -762,4 +779,5 @@ const GsTensorBackend gs_backend_cpu = {
     .causal_mask_add = cpu_causal_mask_add,
     .randn = cpu_randn,
     .adamw_step = cpu_adamw_step,
+    .adamw_multi_step = cpu_adamw_multi_step,
 };

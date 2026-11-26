@@ -101,6 +101,62 @@ void gs_t_adamw_step(int32_t dk, int32_t did, const float *p, const float *g, co
     backend_for(dk)->adamw_step(did, p, g, m, v, p_out, m_out, v_out, n, lr, beta1, beta2, eps, wd, bc1, bc2);
 }
 
+typedef struct {
+    int32_t count;
+    int32_t cap;
+    const float **ps, **gs, **ms, **vs;
+    float **p_outs, **m_outs, **v_outs;
+    int64_t *numels;
+} GsAdamwBatch;
+
+void *gs_t_adamw_batch_new(int32_t cap) {
+    if (cap <= 0) cap = 1;
+    GsAdamwBatch *b = (GsAdamwBatch *)calloc(1, sizeof(GsAdamwBatch));
+    if (!b) return NULL;
+    b->cap = cap;
+    b->ps = (const float **)malloc((size_t)cap * sizeof(float *));
+    b->gs = (const float **)malloc((size_t)cap * sizeof(float *));
+    b->ms = (const float **)malloc((size_t)cap * sizeof(float *));
+    b->vs = (const float **)malloc((size_t)cap * sizeof(float *));
+    b->p_outs = (float **)malloc((size_t)cap * sizeof(float *));
+    b->m_outs = (float **)malloc((size_t)cap * sizeof(float *));
+    b->v_outs = (float **)malloc((size_t)cap * sizeof(float *));
+    b->numels = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    return (void *)b;
+}
+
+void gs_t_adamw_batch_add(
+    void *handle,
+    const float *p, const float *g, const float *m, const float *v,
+    float *p_out, float *m_out, float *v_out,
+    int64_t n
+) {
+    GsAdamwBatch *b = (GsAdamwBatch *)handle;
+    if (!b || b->count >= b->cap) return;
+    int32_t i = b->count++;
+    b->ps[i] = p; b->gs[i] = g; b->ms[i] = m; b->vs[i] = v;
+    b->p_outs[i] = p_out; b->m_outs[i] = m_out; b->v_outs[i] = v_out;
+    b->numels[i] = n;
+}
+
+void gs_t_adamw_batch_run(
+    void *handle, int32_t dk, int32_t did,
+    float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2
+) {
+    GsAdamwBatch *b = (GsAdamwBatch *)handle;
+    if (!b) return;
+    if (b->count > 0) {
+        backend_for(dk)->adamw_multi_step(
+            did, b->count, b->ps, b->gs, b->ms, b->vs,
+            b->p_outs, b->m_outs, b->v_outs, b->numels,
+            lr, beta1, beta2, eps, wd, bc1, bc2
+        );
+    }
+    free(b->ps); free(b->gs); free(b->ms); free(b->vs);
+    free(b->p_outs); free(b->m_outs); free(b->v_outs); free(b->numels);
+    free(b);
+}
+
 // ============================================================================
 // Binary File Helpers for Pure-Geisha Safetensors
 // ============================================================================

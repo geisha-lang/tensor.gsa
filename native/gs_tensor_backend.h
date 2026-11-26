@@ -129,6 +129,15 @@ typedef struct GsTensorBackend {
         float lr, float beta1, float beta2, float eps, float wd,
         float bc1, float bc2
     );
+    void  (*adamw_multi_step)(
+        int32_t dev_id, int32_t count,
+        const float *const *ps, const float *const *gs,
+        const float *const *ms, const float *const *vs,
+        float *const *p_outs, float *const *m_outs, float *const *v_outs,
+        const int64_t *numels,
+        float lr, float beta1, float beta2, float eps, float wd,
+        float bc1, float bc2
+    );
 } GsTensorBackend;
 
 extern const GsTensorBackend gs_backend_cpu;

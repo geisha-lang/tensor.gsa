@@ -82,6 +82,9 @@ pub extern noalloc "gs_t_transpose_0213" def c_transpose_0213(dk: Int, did: Int,
 pub extern noalloc "gs_t_causal_mask_add" def c_causal_mask_add(dk: Int, did: Int, scores: ScopedPtr, bh: Int, seq: Int): Void
 pub extern noalloc "gs_t_randn" def c_randn(dk: Int, did: Int, dst: ScopedPtr, n: Int64, seed: Int64, std: Float32): Void
 pub extern noalloc "gs_t_adamw_step" def c_adamw_step(dk: Int, did: Int, p: ScopedPtr, g: ScopedPtr, m: ScopedPtr, v: ScopedPtr, p_out: ScopedPtr, m_out: ScopedPtr, v_out: ScopedPtr, n: Int64, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32): Void
+pub extern noalloc "gs_t_adamw_batch_new" def c_adamw_batch_new(cap: Int): Ptr
+pub extern noalloc "gs_t_adamw_batch_add" def c_adamw_batch_add(h: Ptr, p: ScopedPtr, g: ScopedPtr, m: ScopedPtr, v: ScopedPtr, po: ScopedPtr, mo: ScopedPtr, vo: ScopedPtr, n: Int64): Void
+pub extern noalloc "gs_t_adamw_batch_run" def c_adamw_batch_run(h: Ptr, dk: Int, did: Int, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32): Void
 
 pub extern "gs_t_fopen_wb" def c_fopen_wb(path: String): Ptr
 pub extern "gs_t_fopen_rb" def c_fopen_rb(path: String): Ptr
