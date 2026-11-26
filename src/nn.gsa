@@ -1,0 +1,227 @@
+// Functional Neural Network layers as plain ADTs with zero-keyword `Params` & `StateDict`
+// deriving and HuggingFace `LlamaForCausalLM`-aligned field names.
+
+use std.option.{Option, Some, None}
+use std.list.{listRev}
+use tensor.tensor.{
+    Tensor, IntTensor, Device, Cpu,
+    zerosOn, onesOn, randnOn, dimAt,
+    add, mul, scale, addRowBias, matmulNT, bgemm, bgemmNT,
+    reshape, transpose0213, silu, rmsNorm, softmax, embedding, rope, causalMask
+}
+use tensor.ad.Params
+use tensor.safetensors.StateDict
+
+// ============================================================================
+// Explicit Deterministic PRNG Key
+// ============================================================================
+
+pub data Rng {
+    seed: Int64,
+}
+
+pub def rngNew(seed: Int): Rng = Rng { seed: intToI64(seed) }
+
+pub def rngNext(r: Rng): (Int64, Rng) = {
+    let next = r.seed * intToI64(1664525) + intToI64(1013904223);
+    (next, Rng { seed: next })
+}
+
+// ============================================================================
+// Core Layer ADTs (zero `Mk*`, zero-keyword `: Params, StateDict`)
+// ============================================================================
+
+pub data Linear : Params, StateDict {
+    weight: Tensor,
+    bias: Option Tensor,
+}
+
+pub data Embedding : Params, StateDict {
+    weight: Tensor,
+}
+
+pub data RMSNorm : Params, StateDict {
+    weight: Tensor,
+    eps: Float,
+}
+
+pub data SwiGLU : Params, StateDict {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+pub data Attention : Params, StateDict {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    nHeads: Int,
+    headDim: Int,
+    ropeTheta: Float,
+}
+
+pub data TransformerBlock : Params, StateDict {
+    input_layernorm: RMSNorm,
+    self_attn: Attention,
+    post_attention_layernorm: RMSNorm,
+    mlp: SwiGLU,
+}
+
+pub data TransformerModel : Params, StateDict {
+    embed_tokens: Embedding,
+    layers: List TransformerBlock,
+    norm: RMSNorm,
+}
+
+pub data CausalLM : Params, StateDict {
+    model: TransformerModel,
+    lm_head: Linear,
+}
+
+pub data LMConfig {
+    vocabSize: Int,
+    hiddenSize: Int,
+    intermediateSize: Int,
+    numLayers: Int,
+    numHeads: Int,
+    rmsNormEps: Float,
+    ropeTheta: Float,
+    device: Device,
+}
+
+// ============================================================================
+// Initializers (explicit PRNG threading, PyTorch/HF `[out, in]` weight layout)
+// ============================================================================
+
+pub def initLinear(inDim: Int, outDim: Int, withBias: Bool, dev: Device, r: Rng): (Linear, Rng) = {
+    let (s, r1) = rngNext(r);
+    let std = 1.0 / f32ToFloat(mathSqrtF32(floatToF32(intToFloat(inDim))));
+    let w = randnOn([outDim, inDim], s, std, dev);
+    let b = if (withBias) Some(zerosOn([outDim], dev)) else None;
+    (Linear { weight: w, bias: b }, r1)
+}
+
+pub def initEmbedding(vocab: Int, dim: Int, dev: Device, r: Rng): (Embedding, Rng) = {
+    let (s, r1) = rngNext(r);
+    (Embedding { weight: randnOn([vocab, dim], s, 0.02, dev) }, r1)
+}
+
+pub def initRMSNorm(dim: Int, eps: Float, dev: Device): RMSNorm =
+    RMSNorm { weight: onesOn([dim], dev), eps: eps }
+
+pub def initSwiGLU(dim: Int, hiddenDim: Int, dev: Device, r: Rng): (SwiGLU, Rng) = {
+    let (gp, r1) = initLinear(dim, hiddenDim, false, dev, r);
+    let (up, r2) = initLinear(dim, hiddenDim, false, dev, r1);
+    let (dp, r3) = initLinear(hiddenDim, dim, false, dev, r2);
+    (SwiGLU { gate_proj: gp, up_proj: up, down_proj: dp }, r3)
+}
+
+pub def initAttention(dim: Int, nHeads: Int, ropeTheta: Float, dev: Device, r: Rng): (Attention, Rng) = {
+    let (qp, r1) = initLinear(dim, dim, false, dev, r);
+    let (kp, r2) = initLinear(dim, dim, false, dev, r1);
+    let (vp, r3) = initLinear(dim, dim, false, dev, r2);
+    let (op, r4) = initLinear(dim, dim, false, dev, r3);
+    (Attention {
+        q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op,
+        nHeads: nHeads, headDim: dim / nHeads, ropeTheta: ropeTheta,
+    }, r4)
+}
+
+pub def initTransformerBlock(cfg: LMConfig, r: Rng): (TransformerBlock, Rng) = {
+    let (attn, r1) = initAttention(cfg.hiddenSize, cfg.numHeads, cfg.ropeTheta, cfg.device, r);
+    let (mlp, r2) = initSwiGLU(cfg.hiddenSize, cfg.intermediateSize, cfg.device, r1);
+    (TransformerBlock {
+        input_layernorm: initRMSNorm(cfg.hiddenSize, cfg.rmsNormEps, cfg.device),
+        self_attn: attn,
+        post_attention_layernorm: initRMSNorm(cfg.hiddenSize, cfg.rmsNormEps, cfg.device),
+        mlp: mlp,
+    }, r2)
+}
+
+pub def initCausalLM(cfg: LMConfig, r: Rng): (CausalLM, Rng) = {
+    let (emb, r1) = initEmbedding(cfg.vocabSize, cfg.hiddenSize, cfg.device, r);
+    let rCur = cellNew(r1);
+    let layersRev = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < cfg.numLayers) {
+        let (blk, rNext) = initTransformerBlock(cfg, cellGet(rCur));
+        cellSet(layersRev, Cons(blk, cellGet(layersRev)));
+        cellSet(rCur, rNext);
+        cellSet(i, cellGet(i) + 1)
+    };
+    let (head, rFinal) = initLinear(cfg.hiddenSize, cfg.vocabSize, false, cfg.device, cellGet(rCur));
+    let m = TransformerModel {
+        embed_tokens: emb,
+        layers: listRev(cellGet(layersRev)),
+        norm: initRMSNorm(cfg.hiddenSize, cfg.rmsNormEps, cfg.device),
+    };
+    (CausalLM { model: m, lm_head: head }, rFinal)
+}
+
+// ============================================================================
+// Pure Functional Forward Passes
+// ============================================================================
+
+pub def linearFwd(l: Linear, x: Tensor): Tensor = {
+    let y = matmulNT(x, l.weight);
+    match l.bias {
+        Some(b) -> addRowBias(y, b),
+        None -> y,
+    }
+}
+
+pub def embeddingFwd(e: Embedding, ids: IntTensor): Tensor =
+    embedding(e.weight, ids)
+
+pub def rmsNormFwd(n: RMSNorm, x: Tensor): Tensor =
+    rmsNorm(x, n.weight, n.eps)
+
+pub def swigluFwd(m: SwiGLU, x: Tensor): Tensor = {
+    let gate = silu(linearFwd(m.gate_proj, x));
+    let up = linearFwd(m.up_proj, x);
+    linearFwd(m.down_proj, mul(gate, up))
+}
+
+pub def attentionFwd(a: Attention, x: Tensor): Tensor = {
+    let b = dimAt(x.shape, 0);
+    let t = dimAt(x.shape, 1);
+    let h = a.nHeads;
+    let hd = a.headDim;
+    let q0 = reshape(linearFwd(a.q_proj, x), [b, t, h, hd]);
+    let k0 = reshape(linearFwd(a.k_proj, x), [b, t, h, hd]);
+    let v0 = reshape(linearFwd(a.v_proj, x), [b, t, h, hd]);
+    let qr = rope(q0, a.ropeTheta);
+    let kr = rope(k0, a.ropeTheta);
+    // [B, T, H, D] -> [B, H, T, D] -> [B*H, T, D]
+    let q = reshape(transpose0213(qr), [b * h, t, hd]);
+    let k = reshape(transpose0213(kr), [b * h, t, hd]);
+    let v = reshape(transpose0213(v0), [b * h, t, hd]);
+    let invSqrtD = 1.0 / f32ToFloat(mathSqrtF32(floatToF32(intToFloat(hd))));
+    let scores = causalMask(scale(bgemmNT(q, k), invSqrtD));
+    let probs = softmax(scores);
+    let ctx = bgemm(probs, v);
+    // [B*H, T, D] -> [B, H, T, D] -> [B, T, H, D] -> [B, T, H*D]
+    let ctx4 = transpose0213(reshape(ctx, [b, h, t, hd]));
+    linearFwd(a.o_proj, reshape(ctx4, [b, t, h * hd]))
+}
+
+pub def blockFwd(blk: TransformerBlock, x: Tensor): Tensor = {
+    let h = x + attentionFwd(blk.self_attn, rmsNormFwd(blk.input_layernorm, x));
+    h + swigluFwd(blk.mlp, rmsNormFwd(blk.post_attention_layernorm, h))
+}
+
+pub def causalLMFwd(lm: CausalLM, ids: IntTensor): Tensor = {
+    let h = cellNew(embeddingFwd(lm.model.embed_tokens, ids));
+    let cur = cellNew(lm.model.layers);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(blk, r) -> {
+                cellSet(h, blockFwd(blk, cellGet(h)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    linearFwd(lm.lm_head, rmsNormFwd(lm.model.norm, cellGet(h)))
+}

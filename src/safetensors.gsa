@@ -1,0 +1,313 @@
+// Pure-Geisha Safetensors reader/writer + HuggingFace-compatible `StateDict`
+// auto-deriving (`Named` field paths match HF `LlamaForCausalLM` 1-to-1!).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listMap}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecToList}
+use std.map.{StrMap, strMapNew, strMapInsert, strMapGet}
+use std.str.intToStr
+use std.buf.{bufNew, bufPushByte, bufToString}
+use std.codec.{Value, VObj, VArr, VStr, VInt, object, array, strVal, i64Val, (:=)}
+use std.json.{parse, stringify, stringifyPretty}
+use sys.fs.writeFile
+use tensor.tensor.{
+    Tensor, Device, Cpu, allocTensorOn, toDevice, tensorDevice,
+    c_fopen_wb, c_fopen_rb, c_fclose, c_fwrite_u64_le, c_fread_u64_le,
+    c_fwrite_bytes, c_fread_bytes, c_fwrite_cstr
+}
+
+// ============================================================================
+// `StateDict` Concept (auto-derivable via `data T : StateDict { ... }`)
+// ============================================================================
+
+pub concept StateDict a {
+    def collectState(prefix: String, x: a, out: Vec (String, Tensor)): Void,
+    def loadState(prefix: String, x: a, tbl: StrMap Tensor, errOut: Cell (Option String)): a
+}
+
+def joinKey(prefix: String, seg: String): String =
+    if (strLen(prefix) == 0) seg else prefix + "." + seg
+
+instance StateDict Tensor {
+    def collectState(prefix, t, out) = vecPush(out, (prefix, t))
+    def loadState(prefix, t, tbl, errOut) = match strMapGet(tbl, prefix) {
+        Some(loaded) -> toDevice(loaded, tensorDevice(t)),
+        None -> {
+            match cellGet(errOut) {
+                None -> cellSet(errOut, Some("Missing tensor key in safetensors: " + prefix)),
+                Some(_) -> (),
+            };
+            t
+        },
+    }
+}
+
+instance StateDict Unit {
+    def collectState(_, _, _) = ()
+    def loadState(_, u, _, _) = u
+}
+
+instance (StateDict a) => StateDict (Named a) {
+    def collectState(prefix, x, out) = match x {
+        Named(k, v) -> collectState(joinKey(prefix, k), v, out),
+    }
+    def loadState(prefix, x, tbl, errOut) = match x {
+        Named(k, v) -> Named(k, loadState(joinKey(prefix, k), v, tbl, errOut)),
+    }
+}
+
+instance (StateDict a, StateDict b) => StateDict (Prod a b) {
+    def collectState(prefix, x, out) = match x {
+        Prod(a, b) -> {
+            collectState(prefix, a, out);
+            collectState(prefix, b, out)
+        },
+    }
+    def loadState(prefix, x, tbl, errOut) = match x {
+        Prod(a, b) -> Prod(loadState(prefix, a, tbl, errOut), loadState(prefix, b, tbl, errOut)),
+    }
+}
+
+instance (StateDict a, StateDict b) => StateDict (Sum a b) {
+    def collectState(prefix, x, out) = match x {
+        InL(a) -> collectState(prefix, a, out),
+        InR(b) -> collectState(prefix, b, out),
+    }
+    def loadState(prefix, x, tbl, errOut) = match x {
+        InL(a) -> InL(loadState(prefix, a, tbl, errOut)),
+        InR(b) -> InR(loadState(prefix, b, tbl, errOut)),
+    }
+}
+
+instance (StateDict a) => StateDict (List a) {
+    def collectState(prefix, xs, out) = {
+        let cur = cellNew(xs);
+        let idx = cellNew(0);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, r) -> {
+                    collectState(joinKey(prefix, intToStr(cellGet(idx))), h, out);
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    }
+    def loadState(prefix, xs, tbl, errOut) = {
+        let cur = cellNew(xs);
+        let idx = cellNew(0);
+        let acc = cellNew(Nil);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, r) -> {
+                    let lh = loadState(joinKey(prefix, intToStr(cellGet(idx))), h, tbl, errOut);
+                    cellSet(acc, Cons(lh, cellGet(acc)));
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        listRev(cellGet(acc))
+    }
+}
+
+instance (StateDict a) => StateDict (Option a) {
+    def collectState(prefix, opt, out) = match opt {
+        Some(v) -> collectState(prefix, v, out),
+        None -> (),
+    }
+    def loadState(prefix, opt, tbl, errOut) = match opt {
+        Some(v) -> Some(loadState(prefix, v, tbl, errOut)),
+        None -> None,
+    }
+}
+
+instance StateDict Int {
+    def collectState(_, _, _) = ()
+    def loadState(_, x, _, _) = x
+}
+instance StateDict Float {
+    def collectState(_, _, _) = ()
+    def loadState(_, x, _, _) = x
+}
+instance StateDict Bool {
+    def collectState(_, _, _) = ()
+    def loadState(_, x, _, _) = x
+}
+instance StateDict String {
+    def collectState(_, _, _) = ()
+    def loadState(_, x, _, _) = x
+}
+
+pub def stateDictList(model): forall m. (StateDict m) => m -> List (String, Tensor) = {
+    let out = vecNew();
+    collectState("", model, out);
+    vecToList(out)
+}
+
+// ============================================================================
+// Pure-Geisha Safetensors Writer & Reader
+// ============================================================================
+
+pub def saveSafetensors(path, model): forall m. (StateDict m) => (String, m) -> Result Int String = {
+    let entries = stateDictList(model);
+    let headerFields = cellNew([("__metadata__", object([("format", strVal("pt")), ("framework", strVal("tensor.gsa"))]))]);
+    let hostTensors = vecNew();
+    let offset = cellNew(intToI64(0));
+    let cur = cellNew(entries);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, t), r) -> {
+                let ht = toDevice(t, Cpu);
+                let nbytes = intToI64(ht.numel) * intToI64(4);
+                let startOff = cellGet(offset);
+                let endOff = startOff + nbytes;
+                cellSet(offset, endOff);
+                let shVals = listMap(ht.shape, (d) -> i64Val(intToI64(d)));
+                let metaObj = object([
+                    ("dtype", strVal("F32")),
+                    ("shape", array(shVals)),
+                    ("data_offsets", array([i64Val(startOff), i64Val(endOff)])),
+                ]);
+                cellSet(headerFields, Cons((k, metaObj), cellGet(headerFields)));
+                vecPush(hostTensors, ht);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let headerJson = stringify(object(listRev(cellGet(headerFields))));
+    let headerLen = intToI64(strLen(headerJson));
+    let fp = c_fopen_wb(path);
+    if (ptrIsNull(fp)) {
+        Err("Failed to open safetensors file for write: " + path)
+    } else {
+        let _ = c_fwrite_u64_le(fp, headerLen);
+        let _ = c_fwrite_cstr(fp, headerJson, headerLen);
+        let i = cellNew(0);
+        let count = vecLen(hostTensors);
+        while (cellGet(i) < count) {
+            match vecGet(hostTensors, cellGet(i)) {
+                Some(ht) -> {
+                    let nb = intToI64(ht.numel) * intToI64(4);
+                    let _ = c_fwrite_bytes(fp, ht.buf, nb);
+                    ()
+                },
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        let _ = c_fclose(fp);
+        Ok(count)
+    }
+}
+
+def lookupObjField(fields: List (String, Value), key: String): Option Value = match fields {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else lookupObjField(r, key),
+}
+
+def parseIntList(vs: List Value): List Int = match vs {
+    Nil -> Nil,
+    Cons(VInt(n), r) -> Cons(i64ToInt(n), parseIntList(r)),
+    Cons(_, r) -> parseIntList(r),
+}
+
+pub def loadSafetensors(path, template): forall m. (StateDict m) => (String, m) -> Result m String = {
+    let fp = c_fopen_rb(path);
+    if (ptrIsNull(fp)) {
+        Err("Failed to open safetensors file for read: " + path)
+    } else {
+        let hlen = c_fread_u64_le(fp);
+        if (hlen <= intToI64(0)) {
+            let _ = c_fclose(fp);
+            Err("Invalid safetensors header length")
+        } else {
+            let hlenInt = i64ToInt(hlen);
+            let hbuf = foreignPtrAlloc(hlen + intToI64(1));
+            let _ = c_fread_bytes(fp, hbuf, hlen);
+            let headerStr = withForeignPtr(hbuf, (sp) -> {
+                scopedPtrSetByte(sp, hlenInt, 0);
+                let sb = bufNew();
+                let i = cellNew(0);
+                while (cellGet(i) < hlenInt) {
+                    bufPushByte(sb, scopedPtrByteAt(sp, cellGet(i)));
+                    cellSet(i, cellGet(i) + 1)
+                };
+                bufToString(sb)
+            });
+            match parse(headerStr) {
+                Err(e) -> { let _ = c_fclose(fp); Err("Safetensors JSON header error: " + e) },
+                Ok(VObj(entries)) -> {
+                    let tbl = strMapNew();
+                    let cur = cellNew(entries);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons((k, VObj(meta)), r) -> {
+                                if (k != "__metadata__") {
+                                    match (lookupObjField(meta, "shape"), lookupObjField(meta, "data_offsets")) {
+                                        (Some(VArr(shVs)), Some(VArr(Cons(VInt(sOff), Cons(VInt(eOff), Nil))))) -> {
+                                            let sh = parseIntList(shVs);
+                                            let t = allocTensorOn(sh, Cpu);
+                                            let nb = eOff - sOff;
+                                            let _ = c_fread_bytes(fp, t.buf, nb);
+                                            strMapInsert(tbl, k, t)
+                                        },
+                                        _ -> (),
+                                    }
+                                } else ();
+                                cellSet(cur, r)
+                            },
+                            Cons(_, r) -> cellSet(cur, r),
+                            Nil -> (),
+                        }
+                    };
+                    let _ = c_fclose(fp);
+                    let errCell = cellNew(None);
+                    let restored = loadState("", template, tbl, errCell);
+                    match cellGet(errCell) {
+                        Some(msg) -> Err(msg),
+                        None -> Ok(restored),
+                    }
+                },
+                Ok(_) -> { let _ = c_fclose(fp); Err("Safetensors header root is not a JSON object") },
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HuggingFace `LlamaForCausalLM` config.json Exporter
+// ============================================================================
+
+pub data HfLlamaConfig {
+    vocabSize: Int,
+    hiddenSize: Int,
+    intermediateSize: Int,
+    numHiddenLayers: Int,
+    numAttentionHeads: Int,
+    rmsNormEps: Float,
+    ropeTheta: Float,
+}
+
+pub def saveHfLlamaConfig(path: String, cfg: HfLlamaConfig): Result Void String = {
+    let doc = object([
+        "architectures" := ["LlamaForCausalLM"],
+        "model_type" := "llama",
+        "vocab_size" := cfg.vocabSize,
+        "hidden_size" := cfg.hiddenSize,
+        "intermediate_size" := cfg.intermediateSize,
+        "num_hidden_layers" := cfg.numHiddenLayers,
+        "num_attention_heads" := cfg.numAttentionHeads,
+        "num_key_value_heads" := cfg.numAttentionHeads,
+        "hidden_act" := "silu",
+        "rms_norm_eps" := cfg.rmsNormEps,
+        "rope_theta" := cfg.ropeTheta,
+        "tie_word_embeddings" := false,
+        "torch_dtype" := "float32",
+    ]);
+    writeFile(path, stringifyPretty(doc))
+}

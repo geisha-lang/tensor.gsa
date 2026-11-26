@@ -1,0 +1,185 @@
+// Functional reverse-mode Autodiff (`valueAndGrad`, `grad`) and `Params` Concept
+// with zero-keyword `Generic` deriving (`data MyModel : Params { ... }`).
+
+use std.option.{Option, Some, None}
+use std.list.{listMap, listRev}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet}
+use tensor.tensor.{
+    Tensor, beginTape, endTape, stampLeaf, runBackward,
+    zerosLike, item, sumSqFloat
+}
+
+// ============================================================================
+// `Params` Concept (auto-derivable via `data T : Params { ... }`)
+// ============================================================================
+
+pub concept Params a {
+    def mapParams(f: Tensor -> Tensor, x: a): a,
+    def zipParams(f: (Tensor, Tensor) -> Tensor, x: a, y: a): a,
+    def collectParams(x: a, out: Vec Tensor): Void
+}
+
+instance Params Tensor {
+    def mapParams(f, t) = f(t)
+    def zipParams(f, a, b) = f(a, b)
+    def collectParams(t, out) = vecPush(out, t)
+}
+
+instance Params Unit {
+    def mapParams(_, u) = u
+    def zipParams(_, u, _) = u
+    def collectParams(_, _) = ()
+}
+
+instance (Params a) => Params (Named a) {
+    def mapParams(f, x) = match x { Named(k, v) -> Named(k, mapParams(f, v)) }
+    def zipParams(f, x, y) = match (x, y) {
+        (Named(k, a), Named(_, b)) -> Named(k, zipParams(f, a, b)),
+    }
+    def collectParams(x, out) = match x { Named(_, v) -> collectParams(v, out) }
+}
+
+instance (Params a, Params b) => Params (Prod a b) {
+    def mapParams(f, x) = match x { Prod(a, b) -> Prod(mapParams(f, a), mapParams(f, b)) }
+    def zipParams(f, x, y) = match (x, y) {
+        (Prod(a1, b1), Prod(a2, b2)) -> Prod(zipParams(f, a1, a2), zipParams(f, b1, b2)),
+    }
+    def collectParams(x, out) = match x {
+        Prod(a, b) -> { collectParams(a, out); collectParams(b, out) },
+    }
+}
+
+instance (Params a, Params b) => Params (Sum a b) {
+    def mapParams(f, x) = match x {
+        InL(a) -> InL(mapParams(f, a)),
+        InR(b) -> InR(mapParams(f, b)),
+    }
+    def zipParams(f, x, y) = match (x, y) {
+        (InL(a1), InL(a2)) -> InL(zipParams(f, a1, a2)),
+        (InR(b1), InR(b2)) -> InR(zipParams(f, b1, b2)),
+        (a, _) -> a,
+    }
+    def collectParams(x, out) = match x {
+        InL(a) -> collectParams(a, out),
+        InR(b) -> collectParams(b, out),
+    }
+}
+
+instance (Params a) => Params (List a) {
+    def mapParams(f, xs) = listMap(xs, (x) -> mapParams(f, x))
+    def zipParams(f, xs, ys) = {
+        let cx = cellNew(xs);
+        let cy = cellNew(ys);
+        let acc = cellNew(Nil);
+        while (match (cellGet(cx), cellGet(cy)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+            match (cellGet(cx), cellGet(cy)) {
+                (Cons(a, ra), Cons(b, rb)) -> {
+                    cellSet(acc, Cons(zipParams(f, a, b), cellGet(acc)));
+                    cellSet(cx, ra);
+                    cellSet(cy, rb)
+                },
+                _ -> (),
+            }
+        };
+        listRev(cellGet(acc))
+    }
+    def collectParams(xs, out) = {
+        let cur = cellNew(xs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, r) -> { collectParams(h, out); cellSet(cur, r) },
+                Nil -> (),
+            }
+        }
+    }
+}
+
+instance (Params a) => Params (Option a) {
+    def mapParams(f, opt) = match opt {
+        Some(v) -> Some(mapParams(f, v)),
+        None -> None,
+    }
+    def zipParams(f, ox, oy) = match (ox, oy) {
+        (Some(x), Some(y)) -> Some(zipParams(f, x, y)),
+        _ -> None,
+    }
+    def collectParams(opt, out) = match opt {
+        Some(v) -> collectParams(v, out),
+        None -> (),
+    }
+}
+
+// Non-trainable hyperparameter fields inside layer ADTs pass through untouched!
+instance Params Int {
+    def mapParams(_, x) = x
+    def zipParams(_, x, _) = x
+    def collectParams(_, _) = ()
+}
+instance Params Float {
+    def mapParams(_, x) = x
+    def zipParams(_, x, _) = x
+    def collectParams(_, _) = ()
+}
+instance Params Bool {
+    def mapParams(_, x) = x
+    def zipParams(_, x, _) = x
+    def collectParams(_, _) = ()
+}
+instance Params String {
+    def mapParams(_, x) = x
+    def zipParams(_, x, _) = x
+    def collectParams(_, _) = ()
+}
+
+// ============================================================================
+// Functional `valueAndGrad` & `grad`
+// ============================================================================
+
+pub def valueAndGrad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> (Float, m) = {
+    let tp = beginTape();
+    let tracked = mapParams((t) -> stampLeaf(tp, t), model);
+    let loss = lossFn(tracked);
+    let lossVal = item(loss);
+    let gradVec = runBackward(tp, loss);
+    endTape();
+    let grads = mapParams((t: Tensor) -> match vecGet(gradVec, t.nodeId) {
+        Some(Some(g)) -> g,
+        _ -> zerosLike(t),
+    }, tracked);
+    (lossVal, grads)
+}
+
+pub def grad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> m = {
+    let (_, g) = valueAndGrad(model, lossFn);
+    g
+}
+
+pub def paramCount(model): forall m. (Params m) => m -> Int = {
+    let v = vecNew();
+    collectParams(model, v);
+    let total = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(v)) {
+        match vecGet(v, cellGet(i)) {
+            Some(t) -> cellSet(total, cellGet(total) + t.numel),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(total)
+}
+
+pub def gradNorm(grads): forall m. (Params m) => m -> Float = {
+    let v = vecNew();
+    collectParams(grads, v);
+    let ss = cellNew(0.0);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(v)) {
+        match vecGet(v, cellGet(i)) {
+            Some(t) -> cellSet(ss, cellGet(ss) + sumSqFloat(t)),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    f32ToFloat(mathSqrtF32(floatToF32(cellGet(ss))))
+}

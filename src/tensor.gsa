@@ -1,0 +1,724 @@
+// Core N-D Float32 Tensor, multi-backend Device abstraction (Cpu / Cuda / Metal),
+// ForeignPtr-backed zero-overhead memory, and local-tape reverse-mode autodiff primitives.
+
+use std.option.{Option, Some, None}
+use std.list.{listLen, listMap, listNth, listRev}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
+use std.generic
+
+// ============================================================================
+// Device & Tensor Types (zero `Mk*` record/ADT shorthands)
+// ============================================================================
+
+pub data Device : Eq {
+    Cpu,
+    Cuda(Int),
+    Metal(Int),
+}
+
+pub def devKind(d: Device): Int = match d {
+    Cpu -> 0,
+    Cuda(_) -> 1,
+    Metal(_) -> 2,
+}
+
+pub def devId(d: Device): Int = match d {
+    Cpu -> 0,
+    Cuda(i) -> i,
+    Metal(i) -> i,
+}
+
+pub data Tensor {
+    buf: ForeignPtr,
+    shape: List Int,
+    numel: Int,
+    device: Device,
+    nodeId: Int,
+}
+
+pub data IntTensor {
+    buf: ForeignPtr,
+    shape: List Int,
+    numel: Int,
+    device: Device,
+}
+
+// ============================================================================
+// Native Multi-Backend FFI (`extern noalloc` + ForeignPtr -> ScopedPtr auto-borrow)
+// ============================================================================
+
+extern noalloc "gs_t_cuda_device_count" def c_cuda_device_count(): Int
+extern noalloc "gs_t_alloc" def c_alloc(dk: Int, did: Int, nbytes: Int64): Ptr
+extern noalloc "gs_t_free_fn" def c_free_fn(dk: Int): Ptr
+extern noalloc "gs_t_memcpy_dev" def c_memcpy_dev(dst: ScopedPtr, ddk: Int, ddid: Int, src: ScopedPtr, sdk: Int, sdid: Int, nbytes: Int64): Void
+
+extern noalloc "gs_t_sgemm" def c_sgemm(dk: Int, did: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
+extern noalloc "gs_t_bgemm" def c_bgemm(dk: Int, did: Int, batch: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int, alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr): Void
+
+extern noalloc "gs_t_fill" def c_fill(dk: Int, did: Int, dst: ScopedPtr, n: Int64, val: Float32): Void
+extern noalloc "gs_t_copy" def c_copy(dk: Int, did: Int, dst: ScopedPtr, src: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_add" def c_add(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_sub" def c_sub(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_mul" def c_mul(dk: Int, did: Int, a: ScopedPtr, b: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_scale" def c_scale(dk: Int, did: Int, a: ScopedPtr, s: Float32, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_axpy" def c_axpy(dk: Int, did: Int, alpha: Float32, x: ScopedPtr, y: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_add_row_bias" def c_add_row_bias(dk: Int, did: Int, x: ScopedPtr, bias: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+extern noalloc "gs_t_sum_rows" def c_sum_rows(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+
+extern noalloc "gs_t_silu_fwd" def c_silu_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_silu_bwd" def c_silu_bwd(dk: Int, did: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_gelu_fwd" def c_gelu_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_gelu_bwd" def c_gelu_bwd(dk: Int, did: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_relu_fwd" def c_relu_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_relu_bwd" def c_relu_bwd(dk: Int, did: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, n: Int64): Void
+extern noalloc "gs_t_sum_all" def c_sum_all(dk: Int, did: Int, x: ScopedPtr, n: Int64): Float32
+extern noalloc "gs_t_sum_sq" def c_sum_sq(dk: Int, did: Int, x: ScopedPtr, n: Int64): Float32
+
+extern noalloc "gs_t_rms_norm_fwd" def c_rms_norm_fwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, out: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern noalloc "gs_t_rms_norm_bwd" def c_rms_norm_bwd(dk: Int, did: Int, x: ScopedPtr, w: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, gw: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern noalloc "gs_t_softmax_fwd" def c_softmax_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+extern noalloc "gs_t_softmax_bwd" def c_softmax_bwd(dk: Int, did: Int, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
+extern noalloc "gs_t_cross_entropy_fwd" def c_ce_fwd(dk: Int, did: Int, logits: ScopedPtr, targets: ScopedPtr, probs: ScopedPtr, rows: Int, vocab: Int): Float32
+extern noalloc "gs_t_cross_entropy_bwd" def c_ce_bwd(dk: Int, did: Int, probs: ScopedPtr, targets: ScopedPtr, g_loss: Float32, g_logits: ScopedPtr, rows: Int, vocab: Int): Void
+extern noalloc "gs_t_embedding_fwd" def c_emb_fwd(dk: Int, did: Int, table: ScopedPtr, ids: ScopedPtr, out: ScopedPtr, n_ids: Int, dim: Int): Void
+extern noalloc "gs_t_embedding_bwd" def c_emb_bwd(dk: Int, did: Int, ids: ScopedPtr, gy: ScopedPtr, g_table: ScopedPtr, n_ids: Int, vocab: Int, dim: Int): Void
+extern noalloc "gs_t_rope_fwd" def c_rope_fwd(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, theta: Float32): Void
+extern noalloc "gs_t_rope_bwd" def c_rope_bwd(dk: Int, did: Int, gy: ScopedPtr, gx: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, theta: Float32): Void
+extern noalloc "gs_t_transpose_2d" def c_transpose_2d(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, rows: Int, cols: Int): Void
+extern noalloc "gs_t_transpose_0213" def c_transpose_0213(dk: Int, did: Int, x: ScopedPtr, out: ScopedPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void
+extern noalloc "gs_t_causal_mask_add" def c_causal_mask_add(dk: Int, did: Int, scores: ScopedPtr, bh: Int, seq: Int): Void
+extern noalloc "gs_t_randn" def c_randn(dk: Int, did: Int, dst: ScopedPtr, n: Int64, seed: Int64, std: Float32): Void
+extern noalloc "gs_t_adamw_step" def c_adamw_step(dk: Int, did: Int, p: ScopedPtr, g: ScopedPtr, m: ScopedPtr, v: ScopedPtr, p_out: ScopedPtr, m_out: ScopedPtr, v_out: ScopedPtr, n: Int64, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32): Void
+
+pub extern "gs_t_fopen_wb" def c_fopen_wb(path: String): Ptr
+pub extern "gs_t_fopen_rb" def c_fopen_rb(path: String): Ptr
+pub extern "gs_t_fclose" def c_fclose(fp: Ptr): Int
+pub extern "gs_t_fwrite_u64_le" def c_fwrite_u64_le(fp: Ptr, v: Int64): Int64
+pub extern "gs_t_fread_u64_le" def c_fread_u64_le(fp: Ptr): Int64
+pub extern "gs_t_fwrite_bytes" def c_fwrite_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
+pub extern "gs_t_fread_bytes" def c_fread_bytes(fp: Ptr, p: ScopedPtr, n: Int64): Int64
+pub extern "gs_t_fseek_set" def c_fseek_set(fp: Ptr, off: Int64): Int
+pub extern "gs_t_fwrite_cstr" def c_fwrite_cstr(fp: Ptr, s: String, n: Int64): Int64
+
+pub def cudaDeviceCount(): Int = c_cuda_device_count()
+
+// ============================================================================
+// Shape Helpers & Allocation
+// ============================================================================
+
+pub def shapeProd(sh: List Int): Int = match sh {
+    Nil -> 1,
+    Cons(d, r) -> d * shapeProd(r),
+}
+
+pub def dimAt(sh: List Int, idx: Int): Int = match listNth(sh, idx) {
+    Some(d) -> d,
+    None -> 1,
+}
+
+pub def allocBuf(dev: Device, nbytes: Int64): ForeignPtr = {
+    let dk = devKind(dev);
+    let raw = c_alloc(dk, devId(dev), nbytes);
+    let ffn = c_free_fn(dk);
+    foreignPtrNew(raw, ffn, nbytes)
+}
+
+pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
+    let n = shapeProd(sh);
+    let nb = intToI64(n) * intToI64(4);
+    Tensor { buf: allocBuf(dev, nb), shape: sh, numel: n, device: dev, nodeId: -1 }
+}
+
+pub def zerosOn(sh: List Int, dev: Device): Tensor = allocTensorOn(sh, dev)
+pub def zeros(sh: List Int): Tensor = zerosOn(sh, Cpu)
+
+pub def fullOn(sh: List Int, val: Float, dev: Device): Tensor = {
+    let t = allocTensorOn(sh, dev);
+    c_fill(devKind(dev), devId(dev), t.buf, intToI64(t.numel), floatToF32(val));
+    t
+}
+
+pub def full(sh: List Int, val: Float): Tensor = fullOn(sh, val, Cpu)
+pub def onesOn(sh: List Int, dev: Device): Tensor = fullOn(sh, 1.0, dev)
+pub def ones(sh: List Int): Tensor = onesOn(sh, Cpu)
+pub def zerosLike(t: Tensor): Tensor = zerosOn(t.shape, t.device)
+pub def onesLike(t: Tensor): Tensor = onesOn(t.shape, t.device)
+
+pub def randnOn(sh: List Int, seed: Int64, std: Float, dev: Device): Tensor = {
+    let t = allocTensorOn(sh, dev);
+    c_randn(devKind(dev), devId(dev), t.buf, intToI64(t.numel), seed, floatToF32(std));
+    t
+}
+
+pub def randn(sh: List Int, seed: Int64, std: Float): Tensor = randnOn(sh, seed, std, Cpu)
+
+pub def fromList(sh: List Int, xs: List Float): Tensor = {
+    let t = zerosOn(sh, Cpu);
+    withForeignPtr(t.buf, (sp) -> {
+        let cur = cellNew(xs);
+        let i = cellNew(0);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(v, r) -> {
+                    scopedPtrWriteF32Le(sp, cellGet(i) * 4, floatToF32(v));
+                    cellSet(i, cellGet(i) + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    });
+    t
+}
+
+pub def fromI32ListOn(sh: List Int, xs: List Int, dev: Device): IntTensor = {
+    let n = shapeProd(sh);
+    let nb = intToI64(n) * intToI64(4);
+    let hostBuf = allocBuf(Cpu, nb);
+    withForeignPtr(hostBuf, (sp) -> {
+        let cur = cellNew(xs);
+        let i = cellNew(0);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(v, r) -> {
+                    scopedPtrWriteI32Le(sp, cellGet(i) * 4, v);
+                    cellSet(i, cellGet(i) + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    });
+    if (dev == Cpu) {
+        IntTensor { buf: hostBuf, shape: sh, numel: n, device: Cpu }
+    } else {
+        let devBuf = allocBuf(dev, nb);
+        c_memcpy_dev(devBuf, devKind(dev), devId(dev), hostBuf, 0, 0, nb);
+        IntTensor { buf: devBuf, shape: sh, numel: n, device: dev }
+    }
+}
+
+pub def fromI32List(sh: List Int, xs: List Int): IntTensor = fromI32ListOn(sh, xs, Cpu)
+
+pub def tensorDevice(t: Tensor): Device = t.device
+
+pub def toDevice(t: Tensor, dev: Device): Tensor =
+    if (t.device == dev) t
+    else {
+        let out = allocTensorOn(t.shape, dev);
+        let nb = intToI64(t.numel) * intToI64(4);
+        c_memcpy_dev(out.buf, devKind(dev), devId(dev), t.buf, devKind(t.device), devId(t.device), nb);
+        out
+    }
+
+pub def detach(t: Tensor): Tensor =
+    Tensor { buf: t.buf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1 }
+
+pub def getAt(t: Tensor, idx: Int): Float = {
+    let h = toDevice(t, Cpu);
+    withForeignPtr(h.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
+}
+
+pub def item(t: Tensor): Float = getAt(t, 0)
+
+pub def toList(t: Tensor): List Float = {
+    let h = toDevice(t, Cpu);
+    withForeignPtr(h.buf, (sp) -> {
+        let acc = cellNew(Nil);
+        let i = cellNew(h.numel - 1);
+        while (cellGet(i) >= 0) {
+            let v = f32ToFloat(scopedPtrReadF32Le(sp, cellGet(i) * 4));
+            cellSet(acc, Cons(v, cellGet(acc)));
+            cellSet(i, cellGet(i) - 1)
+        };
+        cellGet(acc)
+    })
+}
+
+pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void =
+    c_axpy(devKind(y.device), devId(y.device), floatToF32(alpha), x.buf, y.buf, intToI64(y.numel))
+
+pub def cloneTensor(t: Tensor): Tensor = {
+    let out = allocTensorOn(t.shape, t.device);
+    c_copy(devKind(t.device), devId(t.device), out.buf, t.buf, intToI64(t.numel));
+    out
+}
+
+// ============================================================================
+// Local-Tape Reverse-Mode Autodiff Engine
+// ============================================================================
+
+pub data TapeNode {
+    bwd: Tensor -> List (Int, Tensor),
+}
+
+pub data Tape {
+    nodes: Vec TapeNode,
+}
+
+def activeTapeCell: Cell (Option Tape) = cellNew(None)
+
+pub def beginTape(): Tape = {
+    let tp = Tape { nodes: vecNew() };
+    cellSet(activeTapeCell, Some(tp));
+    tp
+}
+
+pub def endTape(): Void = cellSet(activeTapeCell, None)
+
+pub def stampLeaf(tp: Tape, t: Tensor): Tensor = {
+    let id = vecLen(tp.nodes);
+    vecPush(tp.nodes, TapeNode { bwd: (_) -> Nil });
+    Tensor { buf: t.buf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id }
+}
+
+def anyTracked(ids: List Int): Bool = match ids {
+    Nil -> false,
+    Cons(i, r) -> if (i >= 0) true else anyTracked(r),
+}
+
+// Public `customVjp` hook: attach any custom backward rule to a forward output tensor!
+pub def customVjp(inputIds: List Int, out: Tensor, bwdFn: Tensor -> List (Int, Tensor)): Tensor =
+    if (!anyTracked(inputIds)) out
+    else match cellGet(activeTapeCell) {
+        None -> out,
+        Some(tp) -> {
+            let id = vecLen(tp.nodes);
+            vecPush(tp.nodes, TapeNode { bwd: bwdFn });
+            Tensor { buf: out.buf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id }
+        },
+    }
+
+pub def runBackward(tp: Tape, loss: Tensor): Vec (Option Tensor) = {
+    let n = vecLen(tp.nodes);
+    let grads = vecNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(grads, None);
+        cellSet(i, cellGet(i) + 1)
+    };
+    if (loss.nodeId >= 0 && loss.nodeId < n) {
+        vecSet(grads, loss.nodeId, Some(onesLike(loss)))
+    } else ();
+    let k = cellNew(n - 1);
+    while (cellGet(k) >= 0) {
+        let idx = cellGet(k);
+        match vecGet(grads, idx) {
+            Some(Some(gOut)) -> match vecGet(tp.nodes, idx) {
+                Some(node) -> {
+                    let contribs = node.bwd(gOut);
+                    let cur = cellNew(contribs);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons((inId, gIn), rest) -> {
+                                if (inId >= 0 && inId < n) {
+                                    match vecGet(grads, inId) {
+                                        Some(Some(existing)) -> axpyInPlace(1.0, gIn, existing),
+                                        _ -> vecSet(grads, inId, Some(cloneTensor(gIn))),
+                                    }
+                                } else ();
+                                cellSet(cur, rest)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+                None -> (),
+            },
+            _ -> (),
+        };
+        cellSet(k, idx - 1)
+    };
+    grads
+}
+
+// ============================================================================
+// Differentiable Tensor Ops
+// ============================================================================
+
+pub def add(a: Tensor, b: Tensor): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    c_add(devKind(a.device), devId(a.device), a.buf, b.buf, out.buf, intToI64(a.numel));
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    customVjp([aid, bid], out, (g: Tensor) -> [(aid, g), (bid, g)])
+}
+
+pub def sub(a: Tensor, b: Tensor): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    c_sub(devKind(a.device), devId(a.device), a.buf, b.buf, out.buf, intToI64(a.numel));
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    customVjp([aid, bid], out, (g: Tensor) -> {
+        let ng = allocTensorOn(g.shape, g.device);
+        c_scale(devKind(g.device), devId(g.device), g.buf, floatToF32(-1.0), ng.buf, intToI64(g.numel));
+        [(aid, g), (bid, ng)]
+    })
+}
+
+pub def mul(a: Tensor, b: Tensor): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    c_mul(devKind(a.device), devId(a.device), a.buf, b.buf, out.buf, intToI64(a.numel));
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    let ad = detach(a);
+    let bd = detach(b);
+    customVjp([aid, bid], out, (g: Tensor) -> {
+        let ga = allocTensorOn(ad.shape, ad.device);
+        let gb = allocTensorOn(bd.shape, bd.device);
+        c_mul(devKind(g.device), devId(g.device), g.buf, bd.buf, ga.buf, intToI64(g.numel));
+        c_mul(devKind(g.device), devId(g.device), g.buf, ad.buf, gb.buf, intToI64(g.numel));
+        [(aid, ga), (bid, gb)]
+    })
+}
+
+pub def scale(a: Tensor, s: Float): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    c_scale(devKind(a.device), devId(a.device), a.buf, floatToF32(s), out.buf, intToI64(a.numel));
+    let aid = a.nodeId;
+    customVjp([aid], out, (g: Tensor) -> {
+        let ga = allocTensorOn(g.shape, g.device);
+        c_scale(devKind(g.device), devId(g.device), g.buf, floatToF32(s), ga.buf, intToI64(g.numel));
+        [(aid, ga)]
+    })
+}
+
+pub def negT(a: Tensor): Tensor = scale(a, -1.0)
+
+instance Add Tensor Tensor Tensor {
+    def (+)(a, b) = add(a, b)
+}
+instance Sub Tensor Tensor Tensor {
+    def (-)(a, b) = sub(a, b)
+}
+instance Mul Tensor Tensor Tensor {
+    def (*)(a, b) = mul(a, b)
+}
+instance Neg Tensor {
+    def neg(a) = negT(a)
+}
+
+pub def addRowBias(x: Tensor, bias: Tensor): Tensor = {
+    let cols = bias.numel;
+    let rows = x.numel / cols;
+    let out = allocTensorOn(x.shape, x.device);
+    c_add_row_bias(devKind(x.device), devId(x.device), x.buf, bias.buf, out.buf, rows, cols);
+    let xid = x.nodeId;
+    let bid = bias.nodeId;
+    customVjp([xid, bid], out, (g: Tensor) -> {
+        let gb = allocTensorOn(bias.shape, bias.device);
+        c_sum_rows(devKind(g.device), devId(g.device), g.buf, gb.buf, rows, cols);
+        [(xid, g), (bid, gb)]
+    })
+}
+
+pub def reshape(t: Tensor, newShape: List Int): Tensor = {
+    let out = Tensor { buf: t.buf, shape: newShape, numel: t.numel, device: t.device, nodeId: -1 };
+    let tid = t.nodeId;
+    let origShape = t.shape;
+    customVjp([tid], out, (g: Tensor) -> [(tid, Tensor { buf: g.buf, shape: origShape, numel: g.numel, device: g.device, nodeId: -1 })])
+}
+
+pub def transpose2d(t: Tensor): Tensor = {
+    let r = dimAt(t.shape, 0);
+    let c = dimAt(t.shape, 1);
+    let out = allocTensorOn([c, r], t.device);
+    c_transpose_2d(devKind(t.device), devId(t.device), t.buf, out.buf, r, c);
+    let tid = t.nodeId;
+    customVjp([tid], out, (g: Tensor) -> {
+        let gx = allocTensorOn([r, c], g.device);
+        c_transpose_2d(devKind(g.device), devId(g.device), g.buf, gx.buf, c, r);
+        [(tid, gx)]
+    })
+}
+
+pub def transpose0213(t: Tensor): Tensor = {
+    let d0 = dimAt(t.shape, 0);
+    let d1 = dimAt(t.shape, 1);
+    let d2 = dimAt(t.shape, 2);
+    let d3 = dimAt(t.shape, 3);
+    let out = allocTensorOn([d0, d2, d1, d3], t.device);
+    c_transpose_0213(devKind(t.device), devId(t.device), t.buf, out.buf, d0, d1, d2, d3);
+    let tid = t.nodeId;
+    customVjp([tid], out, (g: Tensor) -> {
+        let gx = allocTensorOn([d0, d1, d2, d3], g.device);
+        c_transpose_0213(devKind(g.device), devId(g.device), g.buf, gx.buf, d0, d2, d1, d3);
+        [(tid, gx)]
+    })
+}
+
+// 2D Matrix Multiply: A[M, K] @ B[K, N] -> C[M, N]
+pub def matmul(a: Tensor, b: Tensor): Tensor = {
+    let m = dimAt(a.shape, 0);
+    let k = dimAt(a.shape, 1);
+    let n = dimAt(b.shape, 1);
+    let out = allocTensorOn([m, n], a.device);
+    let dk = devKind(a.device);
+    let did = devId(a.device);
+    c_sgemm(dk, did, 0, 0, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    let ad = detach(a);
+    let bd = detach(b);
+    customVjp([aid, bid], out, (g: Tensor) -> {
+        let ga = allocTensorOn([m, k], g.device);
+        let gb = allocTensorOn([k, n], g.device);
+        // dA = dC @ B^T, dB = A^T @ dC
+        c_sgemm(dk, did, 0, 1, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        c_sgemm(dk, did, 1, 0, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
+        [(aid, ga), (bid, gb)]
+    })
+}
+
+// Linear projection: X[..., inDim] @ W[outDim, inDim]^T -> Y[..., outDim]
+// Weight layout is `[outDim, inDim]` (100% PyTorch / HuggingFace / MLX compatible!)
+pub def matmulNT(x: Tensor, w: Tensor): Tensor = {
+    let outDim = dimAt(w.shape, 0);
+    let inDim = dimAt(w.shape, 1);
+    let rows = x.numel / inDim;
+    let outShape = replaceLastDim(x.shape, outDim);
+    let out = allocTensorOn(outShape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_sgemm(dk, did, 0, 1, rows, outDim, inDim, floatToF32(1.0), x.buf, w.buf, floatToF32(0.0), out.buf);
+    let xid = x.nodeId;
+    let wid = w.nodeId;
+    let xd = detach(x);
+    let wd = detach(w);
+    customVjp([xid, wid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(xd.shape, g.device);
+        let gw = allocTensorOn(wd.shape, g.device);
+        // dX = dY @ W, dW = dY^T @ X
+        c_sgemm(dk, did, 0, 0, rows, inDim, outDim, floatToF32(1.0), g.buf, wd.buf, floatToF32(0.0), gx.buf);
+        c_sgemm(dk, did, 1, 0, outDim, inDim, rows, floatToF32(1.0), g.buf, xd.buf, floatToF32(0.0), gw.buf);
+        [(xid, gx), (wid, gw)]
+    })
+}
+
+def replaceLastDim(sh: List Int, newLast: Int): List Int = match sh {
+    Nil -> [newLast],
+    Cons(_, Nil) -> [newLast],
+    Cons(h, r) -> Cons(h, replaceLastDim(r, newLast)),
+}
+
+// Batched GEMM: A[B, M, K] @ B[B, K, N] -> C[B, M, N]
+pub def bgemm(a: Tensor, b: Tensor): Tensor = {
+    let batch = dimAt(a.shape, 0);
+    let m = dimAt(a.shape, 1);
+    let k = dimAt(a.shape, 2);
+    let n = dimAt(b.shape, 2);
+    let out = allocTensorOn([batch, m, n], a.device);
+    let dk = devKind(a.device);
+    let did = devId(a.device);
+    c_bgemm(dk, did, batch, 0, 0, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    let ad = detach(a);
+    let bd = detach(b);
+    customVjp([aid, bid], out, (g: Tensor) -> {
+        let ga = allocTensorOn([batch, m, k], g.device);
+        let gb = allocTensorOn([batch, k, n], g.device);
+        c_bgemm(dk, did, batch, 0, 1, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        c_bgemm(dk, did, batch, 1, 0, k, n, m, floatToF32(1.0), ad.buf, g.buf, floatToF32(0.0), gb.buf);
+        [(aid, ga), (bid, gb)]
+    })
+}
+
+// Batched GEMM NT: A[B, M, K] @ B[B, N, K]^T -> C[B, M, N]
+pub def bgemmNT(a: Tensor, b: Tensor): Tensor = {
+    let batch = dimAt(a.shape, 0);
+    let m = dimAt(a.shape, 1);
+    let k = dimAt(a.shape, 2);
+    let n = dimAt(b.shape, 1);
+    let out = allocTensorOn([batch, m, n], a.device);
+    let dk = devKind(a.device);
+    let did = devId(a.device);
+    c_bgemm(dk, did, batch, 0, 1, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf);
+    let aid = a.nodeId;
+    let bid = b.nodeId;
+    let ad = detach(a);
+    let bd = detach(b);
+    customVjp([aid, bid], out, (g: Tensor) -> {
+        let ga = allocTensorOn([batch, m, k], g.device);
+        let gb = allocTensorOn([batch, n, k], g.device);
+        c_bgemm(dk, did, batch, 0, 0, m, k, n, floatToF32(1.0), g.buf, bd.buf, floatToF32(0.0), ga.buf);
+        c_bgemm(dk, did, batch, 1, 0, n, k, m, floatToF32(1.0), g.buf, ad.buf, floatToF32(0.0), gb.buf);
+        [(aid, ga), (bid, gb)]
+    })
+}
+
+pub def silu(x: Tensor): Tensor = {
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_silu_fwd(dk, did, x.buf, out.buf, intToI64(x.numel));
+    let xid = x.nodeId;
+    let xd = detach(x);
+    customVjp([xid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(xd.shape, g.device);
+        c_silu_bwd(dk, did, xd.buf, g.buf, gx.buf, intToI64(xd.numel));
+        [(xid, gx)]
+    })
+}
+
+pub def gelu(x: Tensor): Tensor = {
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_gelu_fwd(dk, did, x.buf, out.buf, intToI64(x.numel));
+    let xid = x.nodeId;
+    let xd = detach(x);
+    customVjp([xid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(xd.shape, g.device);
+        c_gelu_bwd(dk, did, xd.buf, g.buf, gx.buf, intToI64(xd.numel));
+        [(xid, gx)]
+    })
+}
+
+pub def relu(x: Tensor): Tensor = {
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_relu_fwd(dk, did, x.buf, out.buf, intToI64(x.numel));
+    let xid = x.nodeId;
+    let xd = detach(x);
+    customVjp([xid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(xd.shape, g.device);
+        c_relu_bwd(dk, did, xd.buf, g.buf, gx.buf, intToI64(xd.numel));
+        [(xid, gx)]
+    })
+}
+
+pub def rmsNorm(x: Tensor, w: Tensor, eps: Float): Tensor = {
+    let dim = w.numel;
+    let rows = x.numel / dim;
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_rms_norm_fwd(dk, did, x.buf, w.buf, out.buf, rows, dim, floatToF32(eps));
+    let xid = x.nodeId;
+    let wid = w.nodeId;
+    let xd = detach(x);
+    let wd = detach(w);
+    customVjp([xid, wid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(xd.shape, g.device);
+        let gw = allocTensorOn(wd.shape, g.device);
+        c_rms_norm_bwd(dk, did, xd.buf, wd.buf, g.buf, gx.buf, gw.buf, rows, dim, floatToF32(eps));
+        [(xid, gx), (wid, gw)]
+    })
+}
+
+pub def softmax(x: Tensor): Tensor = {
+    let cols = dimAt(x.shape, listLen(x.shape) - 1);
+    let rows = x.numel / cols;
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_softmax_fwd(dk, did, x.buf, out.buf, rows, cols);
+    let xid = x.nodeId;
+    let yd = detach(out);
+    customVjp([xid], out, (g: Tensor) -> {
+        let gx = allocTensorOn(yd.shape, g.device);
+        c_softmax_bwd(dk, did, yd.buf, g.buf, gx.buf, rows, cols);
+        [(xid, gx)]
+    })
+}
+
+pub def crossEntropy(logits: Tensor, targets: IntTensor): Tensor = {
+    let vocab = dimAt(logits.shape, listLen(logits.shape) - 1);
+    let rows = logits.numel / vocab;
+    let probs = allocTensorOn(logits.shape, logits.device);
+    let dk = devKind(logits.device);
+    let did = devId(logits.device);
+    let lossVal = f32ToFloat(c_ce_fwd(dk, did, logits.buf, targets.buf, probs.buf, rows, vocab));
+    let out = fullOn([1], lossVal, logits.device);
+    let lid = logits.nodeId;
+    let lShape = logits.shape;
+    customVjp([lid], out, (g: Tensor) -> {
+        let gl = allocTensorOn(lShape, logits.device);
+        c_ce_bwd(dk, did, probs.buf, targets.buf, floatToF32(item(g)), gl.buf, rows, vocab);
+        [(lid, gl)]
+    })
+}
+
+pub def embedding(table: Tensor, ids: IntTensor): Tensor = {
+    let vocab = dimAt(table.shape, 0);
+    let dim = dimAt(table.shape, 1);
+    let nIds = ids.numel;
+    let outShape = listRev(Cons(dim, listRev(ids.shape)));
+    let out = allocTensorOn(outShape, table.device);
+    let dk = devKind(table.device);
+    let did = devId(table.device);
+    c_emb_fwd(dk, did, table.buf, ids.buf, out.buf, nIds, dim);
+    let tid = table.nodeId;
+    customVjp([tid], out, (g: Tensor) -> {
+        let gt = allocTensorOn([vocab, dim], table.device);
+        c_emb_bwd(dk, did, ids.buf, g.buf, gt.buf, nIds, vocab, dim);
+        [(tid, gt)]
+    })
+}
+
+// HF Llama half-split RoPE on `[B, T, H, D]`
+pub def rope(x: Tensor, theta: Float): Tensor = {
+    let b = dimAt(x.shape, 0);
+    let s = dimAt(x.shape, 1);
+    let h = dimAt(x.shape, 2);
+    let hd = dimAt(x.shape, 3);
+    let out = allocTensorOn(x.shape, x.device);
+    let dk = devKind(x.device);
+    let did = devId(x.device);
+    c_rope_fwd(dk, did, x.buf, out.buf, b, s, h, hd, floatToF32(theta));
+    let xid = x.nodeId;
+    customVjp([xid], out, (g: Tensor) -> {
+        let gx = allocTensorOn([b, s, h, hd], g.device);
+        c_rope_bwd(dk, did, g.buf, gx.buf, b, s, h, hd, floatToF32(theta));
+        [(xid, gx)]
+    })
+}
+
+pub def causalMask(scores: Tensor): Tensor = {
+    let bh = dimAt(scores.shape, 0);
+    let seq = dimAt(scores.shape, 1);
+    let out = cloneTensor(scores);
+    c_causal_mask_add(devKind(scores.device), devId(scores.device), out.buf, bh, seq);
+    let sid = scores.nodeId;
+    customVjp([sid], out, (g: Tensor) -> [(sid, g)])
+}
+
+pub def sumAll(x: Tensor): Tensor = {
+    let v = f32ToFloat(c_sum_all(devKind(x.device), devId(x.device), x.buf, intToI64(x.numel)));
+    let out = fullOn([1], v, x.device);
+    let xid = x.nodeId;
+    let xShape = x.shape;
+    let xDev = x.device;
+    customVjp([xid], out, (g: Tensor) -> [(xid, fullOn(xShape, item(g), xDev))])
+}
+
+pub def meanAll(x: Tensor): Tensor = {
+    let invN = 1.0 / intToFloat(x.numel);
+    scale(sumAll(x), invN)
+}
+
+pub def sumSqFloat(x: Tensor): Float =
+    f32ToFloat(c_sum_sq(devKind(x.device), devId(x.device), x.buf, intToI64(x.numel)))
+
+pub def l2NormFloat(x: Tensor): Float =
+    f32ToFloat(mathSqrtF32(floatToF32(sumSqFloat(x))))
+
+pub def adamwStepRaw(
+    p: Tensor, g: Tensor, m: Tensor, v: Tensor,
+    lr: Float, beta1: Float, beta2: Float, eps: Float, wd: Float, bc1: Float, bc2: Float
+): (Tensor, Tensor, Tensor) = {
+    let pOut = allocTensorOn(p.shape, p.device);
+    let mOut = allocTensorOn(m.shape, m.device);
+    let vOut = allocTensorOn(v.shape, v.device);
+    c_adamw_step(
+        devKind(p.device), devId(p.device),
+        p.buf, g.buf, m.buf, v.buf,
+        pOut.buf, mOut.buf, vOut.buf,
+        intToI64(p.numel),
+        floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
+        floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
+    );
+    (pOut, mOut, vOut)
+}

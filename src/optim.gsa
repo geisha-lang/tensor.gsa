@@ -1,0 +1,161 @@
+// Pure functional Optax-style optimizers: AdamW, Muon (Newton-Schulz 5-step
+// orthogonalization for 2D matrices + AdamW for 1D/embeddings), and grad clipping.
+
+use std.list.listLen
+use tensor.tensor.{
+    Tensor, zerosLike, dimAt, add, mul, scale, matmul, transpose2d,
+    l2NormFloat, adamwStepRaw, detach
+}
+use tensor.ad.{Params, mapParams, zipParams, gradNorm}
+
+// ============================================================================
+// Gradient Clipping
+// ============================================================================
+
+pub def clipGradNorm(grads, maxNorm): forall m. (Params m) => (m, Float) -> m = {
+    let gn = gradNorm(grads);
+    if (gn > maxNorm && gn > 0.0) {
+        let s = maxNorm / (gn + 1.0e-6);
+        mapParams((g) -> scale(detach(g), s), grads)
+    } else grads
+}
+
+// ============================================================================
+// AdamW (pure functional `(cfg, state, model, grads) -> (newModel, newState)`)
+// ============================================================================
+
+pub data AdamWConfig {
+    lr: Float,
+    beta1: Float,
+    beta2: Float,
+    eps: Float,
+    weightDecay: Float,
+}
+
+pub def defaultAdamW(lr: Float): AdamWConfig =
+    AdamWConfig { lr: lr, beta1: 0.9, beta2: 0.999, eps: 1.0e-8, weightDecay: 0.01 }
+
+pub data AdamWState m {
+    step: Int,
+    m1: m,
+    m2: m,
+}
+
+pub def adamwInit(model): forall m. (Params m) => m -> AdamWState m =
+    AdamWState {
+        step: 0,
+        m1: mapParams((t) -> zerosLike(t), model),
+        m2: mapParams((t) -> zerosLike(t), model),
+    }
+
+pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, AdamWState m, m, m) -> (m, AdamWState m) =
+    match (cfg, st) {
+        (AdamWConfig { lr: lr, beta1: beta1, beta2: beta2, eps: eps, weightDecay: wd },
+         AdamWState { step: curStep, m1: stM1, m2: stM2 }) -> {
+            let nextStep = curStep + 1;
+            let tF = floatToF32(intToFloat(nextStep));
+            let bc1 = 1.0 - f32ToFloat(mathPowF32(floatToF32(beta1), tF));
+            let bc2 = 1.0 - f32ToFloat(mathPowF32(floatToF32(beta2), tF));
+            let m1Out = zipParams((m, g) -> add(scale(detach(m), beta1), scale(detach(g), 1.0 - beta1)), stM1, grads);
+            let m2Out = zipParams((v, g) -> {
+                let g2 = mul(detach(g), detach(g));
+                add(scale(detach(v), beta2), scale(g2, 1.0 - beta2))
+            }, stM2, grads);
+            let pStep = zipParams((m, v) -> {
+                let z = zerosLike(m);
+                let (negDelta, _, _) = adamwStepRaw(z, z, m, v, lr, 1.0, 1.0, eps, 0.0, bc1, bc2);
+                negDelta
+            }, m1Out, m2Out);
+            let pOut = zipParams((p, negDelta) -> {
+                let decayed = scale(detach(p), 1.0 - lr * wd);
+                add(decayed, negDelta)
+            }, model, pStep);
+            (pOut, AdamWState { step: nextStep, m1: m1Out, m2: m2Out })
+        },
+    }
+
+// ============================================================================
+// Muon (Momentum Orthogonalized by Newton-Schulz 5-step)
+// ============================================================================
+
+pub data MuonConfig {
+    lr: Float,
+    momentum: Float,
+    weightDecay: Float,
+    nsSteps: Int,
+    auxLr: Float,
+}
+
+pub def defaultMuon(lr: Float): MuonConfig =
+    MuonConfig { lr: lr, momentum: 0.95, weightDecay: 0.01, nsSteps: 5, auxLr: lr * 0.2 }
+
+pub data MuonState m {
+    step: Int,
+    buf: m,
+    v2: m,
+}
+
+pub def muonInit(model): forall m. (Params m) => m -> MuonState m =
+    MuonState {
+        step: 0,
+        buf: mapParams((t) -> zerosLike(t), model),
+        v2: mapParams((t) -> zerosLike(t), model),
+    }
+
+// Quintic Newton-Schulz iteration (Keller Jordan Muon coefficients):
+//   X <- a*X + (b*A + c*A^2)*X, where A = X @ X^T
+pub def newtonSchulz5(g: Tensor, steps: Int): Tensor = {
+    let rows = dimAt(g.shape, 0);
+    let cols = dimAt(g.shape, 1);
+    let tall = rows > cols;
+    let x0 = if (tall) transpose2d(detach(g)) else detach(g);
+    let norm = l2NormFloat(x0) + 1.0e-7;
+    let x = cellNew(scale(x0, 1.0 / norm));
+    let a = 3.4445;
+    let b = -4.7750;
+    let c = 2.0315;
+    let i = cellNew(0);
+    while (cellGet(i) < steps) {
+        let cur = cellGet(x);
+        let aMat = matmul(cur, transpose2d(cur));
+        let a2 = matmul(aMat, aMat);
+        let bMat = add(scale(aMat, b), scale(a2, c));
+        cellSet(x, add(scale(cur, a), matmul(bMat, cur)));
+        cellSet(i, cellGet(i) + 1)
+    };
+    let res = cellGet(x);
+    if (tall) transpose2d(res) else res
+}
+
+pub def muonStep(cfg, st, model, grads): forall m. (Params m) => (MuonConfig, MuonState m, m, m) -> (m, MuonState m) =
+    match (cfg, st) {
+        (MuonConfig { lr: lr, momentum: momentum, weightDecay: wd, nsSteps: nsSteps, auxLr: auxLr },
+         MuonState { step: curStep, buf: stBuf, v2: stV2 }) -> {
+            let nextStep = curStep + 1;
+            let newBuf = zipParams((b, g) -> add(scale(detach(b), momentum), detach(g)), stBuf, grads);
+            let newV2 = zipParams((v, g) -> {
+                let g2 = mul(detach(g), detach(g));
+                add(scale(detach(v), 0.999), scale(g2, 0.001))
+            }, stV2, grads);
+            let tF = floatToF32(intToFloat(nextStep));
+            let bc2 = 1.0 - f32ToFloat(mathPowF32(floatToF32(0.999), tF));
+            let updates = zipParams((b: Tensor, v: Tensor) -> {
+                if (listLen(b.shape) == 2 && dimAt(b.shape, 0) >= 2 && dimAt(b.shape, 1) >= 2) {
+                    let ortho = newtonSchulz5(b, nsSteps);
+                    let r = intToFloat(dimAt(b.shape, 0));
+                    let c = intToFloat(dimAt(b.shape, 1));
+                    let aspect = if (r > c) f32ToFloat(mathSqrtF32(floatToF32(r / c))) else 1.0;
+                    scale(ortho, -lr * aspect)
+                } else {
+                    let z = zerosLike(b);
+                    let (negDelta, _, _) = adamwStepRaw(z, z, b, v, auxLr, 1.0, 1.0, 1.0e-8, 0.0, 1.0, bc2);
+                    negDelta
+                }
+            }, newBuf, newV2);
+            let newModel = zipParams((p, upd) -> {
+                let decayed = scale(detach(p), 1.0 - lr * wd);
+                add(decayed, upd)
+            }, model, updates);
+            (newModel, MuonState { step: nextStep, buf: newBuf, v2: newV2 })
+        },
+    }
