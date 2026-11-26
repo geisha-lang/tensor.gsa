@@ -33,7 +33,12 @@
   - `native/metal_stubs_linux.c` is compiled **only** on Linux (`[[target.native.when]] os = "linux"`) to satisfy link-time Metal/ObjC symbols.
 - Whenever adding, removing, or changing the signature of any `gs_cu_*` symbol, update **all three** files together: `native/cuda.cu`, `native/cuda_weak_stubs.c`, and `src/cuda.gsa`.
 
-### 6. Geisha Language Gotchas
+### 6. CUDA Async Memory Pool, Uninitialized Allocations & Tensor Cores
+- `allocTensorOn` on CUDA allocates from the default async memory pool (`cudaMallocAsync` / `cudaFreeAsync`, `ReleaseThreshold = UINT64_MAX`) **without zero-filling**. Any op that accumulates into an output buffer (e.g., `catAxis` or custom atomic kernels) **must** use `zerosOn` or `cudaZero` (`cudaMemsetAsync`), never assume `allocTensorOn` is zeroed.
+- Never call synchronous `cudaMemset` in `native/cuda.cu` — always use `cudaMemsetAsync(..., 0)`.
+- `cublasSgemm` enables `CUBLAS_TF32_TENSOR_OP_MATH` by default; `setCudaBf16(true)` switches GEMM/BGEMM to `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_16BF` (keeping FP32 buffers/accumulators).
+
+### 7. Geisha Language Gotchas
 - `Int` literals are 32-bit; express 64-bit constants via `Int64` conversions or keep 64-bit RNG bit-mixing in C/CUDA.
 - Lambda parameters that access record fields need explicit type annotations (e.g. `(g: Tensor) -> ...`).
 

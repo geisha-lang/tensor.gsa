@@ -28,21 +28,39 @@
 #define GS_UOP_RELU    11
 
 static cublasHandle_t g_cublas = NULL;
+static int32_t g_cuda_bf16_gemm = 0;
+static int32_t g_pool_inited[16] = {0};
+
+static void ensure_mempool(int32_t dev_id) {
+    if (dev_id >= 0 && dev_id < 16 && !g_pool_inited[dev_id]) {
+        g_pool_inited[dev_id] = 1;
+        cudaMemPool_t pool = NULL;
+        if (cudaDeviceGetDefaultMemPool(&pool, dev_id) == cudaSuccess && pool != NULL) {
+            uint64_t threshold = UINT64_MAX;
+            cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+        }
+    }
+}
 
 static cublasHandle_t get_cublas(int32_t dev_id) {
     cudaSetDevice(dev_id);
-    if (!g_cublas) cublasCreate(&g_cublas);
+    if (!g_cublas) {
+        cublasCreate(&g_cublas);
+        cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+    }
     return g_cublas;
 }
 
 static inline int grid1d(int64_t n) { return (int)((n + 255) / 256); }
 
 // ============================================================================
-// Device Memory, Sync & BLAS
+// Device Memory (Async Pool), Sync & BLAS (TF32 + Optional BF16 Tensor Core)
 // ============================================================================
 
 static void cu_free_impl(void *ptr) {
-    if (ptr) cudaFree(ptr);
+    if (ptr) {
+        if (cudaFreeAsync(ptr, 0) != cudaSuccess) cudaFree(ptr);
+    }
 }
 
 extern "C" {
@@ -52,17 +70,28 @@ int32_t gs_cu_device_count(void) {
     return cudaGetDeviceCount(&c) == cudaSuccess ? (int32_t)c : 0;
 }
 
+void gs_cu_set_bf16(int32_t enabled) {
+    g_cuda_bf16_gemm = enabled ? 1 : 0;
+}
+
 void *gs_cu_free_fn(void) {
     return (void *)cu_free_impl;
 }
 
 void *gs_cu_alloc(int32_t dev_id, int64_t nbytes) {
     cudaSetDevice(dev_id);
+    ensure_mempool(dev_id);
     void *p = NULL;
     size_t sz = nbytes > 0 ? (size_t)nbytes : 64;
-    if (cudaMalloc(&p, sz) != cudaSuccess) return NULL;
-    cudaMemset(p, 0, sz);
+    if (cudaMallocAsync(&p, sz, 0) != cudaSuccess) {
+        if (cudaMalloc(&p, sz) != cudaSuccess) return NULL;
+    }
     return p;
+}
+
+void gs_cu_zero(int32_t dev_id, void *ptr, int64_t nbytes) {
+    cudaSetDevice(dev_id);
+    if (ptr && nbytes > 0) cudaMemsetAsync(ptr, 0, (size_t)nbytes, 0);
 }
 
 void gs_cu_free(void *ptr) { cu_free_impl(ptr); }
@@ -84,7 +113,7 @@ void gs_cu_d2h(int32_t d, void *dst, const void *src, int64_t n) {
 
 void gs_cu_d2d(int32_t d, void *dst, const void *src, int64_t n) {
     cudaSetDevice(d);
-    if (n > 0 && dst != src) cudaMemcpy(dst, src, (size_t)n, cudaMemcpyDeviceToDevice);
+    if (n > 0 && dst != src) cudaMemcpyAsync(dst, src, (size_t)n, cudaMemcpyDeviceToDevice, 0);
 }
 
 void gs_cu_sgemm(
@@ -93,15 +122,22 @@ void gs_cu_sgemm(
     float alpha, const float *A, const float *B, float beta, float *C
 ) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    cublasSgemm(
-        get_cublas(d),
-        tb ? CUBLAS_OP_T : CUBLAS_OP_N,
-        ta ? CUBLAS_OP_T : CUBLAS_OP_N,
-        N, M, K, &alpha,
-        B, tb ? K : N,
-        A, ta ? M : K,
-        &beta, C, N
-    );
+    cublasHandle_t h = get_cublas(d);
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int ldb = tb ? K : N;
+    int lda = ta ? M : K;
+    if (g_cuda_bf16_gemm) {
+        cublasGemmEx(
+            h, opB, opA, N, M, K, &alpha,
+            B, CUDA_R_32F, ldb,
+            A, CUDA_R_32F, lda,
+            &beta, C, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+    } else {
+        cublasSgemm(h, opB, opA, N, M, K, &alpha, B, ldb, A, lda, &beta, C, N);
+    }
 }
 
 void gs_cu_bgemm(
@@ -110,15 +146,27 @@ void gs_cu_bgemm(
     float alpha, const float *A, const float *B, float beta, float *C
 ) {
     if (batch <= 0 || M <= 0 || N <= 0 || K <= 0) return;
-    cublasSgemmStridedBatched(
-        get_cublas(d),
-        tb ? CUBLAS_OP_T : CUBLAS_OP_N,
-        ta ? CUBLAS_OP_T : CUBLAS_OP_N,
-        N, M, K, &alpha,
-        B, tb ? K : N, (long long)K * N,
-        A, ta ? M : K, (long long)M * K,
-        &beta, C, N, (long long)M * N, batch
-    );
+    cublasHandle_t h = get_cublas(d);
+    cublasOperation_t opB = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opA = ta ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int ldb = tb ? K : N;
+    int lda = ta ? M : K;
+    if (g_cuda_bf16_gemm) {
+        cublasGemmStridedBatchedEx(
+            h, opB, opA, N, M, K, &alpha,
+            B, CUDA_R_32F, ldb, (long long)K * N,
+            A, CUDA_R_32F, lda, (long long)M * K,
+            &beta, C, CUDA_R_32F, N, (long long)M * N, batch,
+            CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+    } else {
+        cublasSgemmStridedBatched(
+            h, opB, opA, N, M, K, &alpha,
+            B, ldb, (long long)K * N,
+            A, lda, (long long)M * K,
+            &beta, C, N, (long long)M * N, batch
+        );
+    }
 }
 
 } // extern "C"
@@ -443,43 +491,50 @@ __global__ void k_lse_b(const float *x, const float *lse, const float *gy, float
     gx[idx] = gy[r] * expf(x[idx] - lse[r]);
 }
 
-__global__ void k_ce_fwd_loss(
-    const float *probs, const int32_t *targets,
-    float *loss_sum, int32_t *valid_cnt,
+__global__ void k_ce_fused_fwd(
+    const float *logits, const int32_t *targets,
+    float *lse_out, float *loss_sum, int32_t *valid_cnt,
     int32_t rows, int32_t vocab, int32_t ignore_idx
 ) {
-    float l_loss = 0.0f;
-    int32_t l_val = 0;
-    for (int32_t r = blockIdx.x * 256 + threadIdx.x; r < rows; r += gridDim.x * 256) {
-        int32_t t = targets[r];
-        if (t != ignore_idx && t >= 0 && t < vocab) {
-            l_loss -= logf(probs[(int64_t)r * vocab + t] + 1e-12f);
-            l_val += 1;
-        }
+    int32_t r = blockIdx.x;
+    if (r >= rows) return;
+    int32_t t = targets[r];
+    if (t == ignore_idx || t < 0 || t >= vocab) {
+        if (threadIdx.x == 0) lse_out[r] = 0.0f;
+        return;
     }
-    float b_loss = block_reduce_sum(l_loss);
-    float b_val = block_reduce_sum((float)l_val);
+    const float *xr = logits + (int64_t)r * vocab;
+    float lmx = -1.0e38f;
+    for (int32_t c = threadIdx.x; c < vocab; c += 256) {
+        if (xr[c] > lmx) lmx = xr[c];
+    }
+    float mx = block_reduce_max(lmx);
+    float lsum = 0.0f;
+    for (int32_t c = threadIdx.x; c < vocab; c += 256) {
+        lsum += expf(xr[c] - mx);
+    }
+    float sum = block_reduce_sum(lsum);
     if (threadIdx.x == 0) {
-        atomicAdd(loss_sum, b_loss);
-        atomicAdd(valid_cnt, (int32_t)b_val);
+        float lse = mx + logf(sum);
+        lse_out[r] = lse;
+        atomicAdd(loss_sum, lse - xr[t]);
+        atomicAdd(valid_cnt, 1);
     }
 }
 
-__global__ void k_ce_count_valid(const int32_t *targets, int32_t *valid_cnt, int32_t rows, int32_t vocab, int32_t ignore_idx) {
-    int32_t l_val = 0;
-    for (int32_t r = blockIdx.x * 256 + threadIdx.x; r < rows; r += gridDim.x * 256) {
-        int32_t t = targets[r];
-        if (t != ignore_idx && t >= 0 && t < vocab) l_val += 1;
-    }
-    float b_val = block_reduce_sum((float)l_val);
-    if (threadIdx.x == 0) atomicAdd(valid_cnt, (int32_t)b_val);
-}
-
-__global__ void k_ce_bwd(const float *probs, const int32_t *targets, float scale, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx) {
+__global__ void k_ce_fused_bwd(
+    const float *logits, const float *lse, const int32_t *targets,
+    float scale, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx
+) {
     int64_t idx = blockIdx.x * 256LL + threadIdx.x;
     if (idx >= (int64_t)rows * vocab) return;
     int32_t r = (int32_t)(idx / vocab), c = (int32_t)(idx % vocab), tgt = targets[r];
-    gl[idx] = (tgt == ignore_idx || tgt < 0 || tgt >= vocab) ? 0.0f : (probs[idx] * scale - ((c == tgt) ? scale : 0.0f));
+    if (tgt == ignore_idx || tgt < 0 || tgt >= vocab) {
+        gl[idx] = 0.0f;
+    } else {
+        float p = expf(logits[idx] - lse[r]);
+        gl[idx] = p * scale - ((c == tgt) ? scale : 0.0f);
+    }
 }
 
 __global__ void k_emb_f(const float *tab, const int32_t *ids, float *o, int32_t n_ids, int32_t dim) {
@@ -623,7 +678,7 @@ void gs_cu_bcast_reduce_sum(int32_t d, int32_t ndim, int64_t src_total, int64_t 
     BcastMeta m = {{0}, {0}, {0}};
     for (int32_t i = 0; i < ndim && i < 8; i++) { m.sh[i] = sh[i]; m.sa[i] = sd[i]; }
     cudaSetDevice(d);
-    if (dst_total > 0) cudaMemset(dst, 0, (size_t)dst_total * sizeof(float));
+    if (dst_total > 0) cudaMemsetAsync(dst, 0, (size_t)dst_total * sizeof(float), 0);
     if (src_total > 0) k_bcast_reduce_sum<<<grid1d(src_total), 256>>>(ndim, src_total, m, src, dst);
 }
 void gs_cu_unary_f(int32_t d, int32_t op, const float *x, float *o, int64_t n) {
@@ -641,7 +696,7 @@ void gs_cu_slice_f(int32_t d, const float *x, float *o, int32_t out0, int32_t id
 }
 void gs_cu_slice_b(int32_t d, const float *gy, float *gx, int32_t out0, int32_t id, int32_t in0, int32_t st, int32_t len) {
     cudaSetDevice(d);
-    cudaMemset(gx, 0, (size_t)((int64_t)out0 * id * in0) * sizeof(float));
+    cudaMemsetAsync(gx, 0, (size_t)((int64_t)out0 * id * in0) * sizeof(float), 0);
     int64_t tot = (int64_t)out0 * len * in0;
     if (tot > 0) k_slice_b<<<grid1d(tot), 256>>>(gy, gx, out0, id, in0, st, len);
 }
@@ -668,7 +723,7 @@ static void ensure_scratch(int32_t d) {
 double gs_cu_sum_all(int32_t d, const float *x, int64_t n) {
     if (n <= 0) return 0.0;
     ensure_scratch(d);
-    cudaMemset(g_reduce_buf, 0, sizeof(float));
+    cudaMemsetAsync(g_reduce_buf, 0, sizeof(float), 0);
     int blocks = (int)((n + 255) / 256);
     if (blocks > 1024) blocks = 1024;
     k_reduce_sum_all<<<blocks, 256>>>(x, g_reduce_buf, n, 0);
@@ -680,7 +735,7 @@ double gs_cu_sum_all(int32_t d, const float *x, int64_t n) {
 double gs_cu_sum_sq(int32_t d, const float *x, int64_t n) {
     if (n <= 0) return 0.0;
     ensure_scratch(d);
-    cudaMemset(g_reduce_buf, 0, sizeof(float));
+    cudaMemsetAsync(g_reduce_buf, 0, sizeof(float), 0);
     int blocks = (int)((n + 255) / 256);
     if (blocks > 1024) blocks = 1024;
     k_reduce_sum_all<<<blocks, 256>>>(x, g_reduce_buf, n, 1);
@@ -695,7 +750,7 @@ void gs_cu_rms_f(int32_t d, const float *x, const float *w, float *o, int32_t r,
 }
 void gs_cu_rms_b(int32_t d, const float *x, const float *w, const float *gy, float *gx, float *gw, int32_t r, int32_t dim, float eps) {
     cudaSetDevice(d);
-    cudaMemset(gw, 0, (size_t)dim * sizeof(float));
+    cudaMemsetAsync(gw, 0, (size_t)dim * sizeof(float), 0);
     if (r > 0) k_rms_b<<<r, 256>>>(x, w, gy, gx, gw, r, dim, eps);
 }
 void gs_cu_ln_f(int32_t d, const float *x, const float *w, const float *b, float *o, int32_t r, int32_t dim, float eps) {
@@ -704,8 +759,8 @@ void gs_cu_ln_f(int32_t d, const float *x, const float *w, const float *b, float
 }
 void gs_cu_ln_b(int32_t d, const float *x, const float *w, const float *gy, float *gx, float *gw, float *gb, int32_t r, int32_t dim, float eps) {
     cudaSetDevice(d);
-    cudaMemset(gw, 0, (size_t)dim * sizeof(float));
-    if (gb) cudaMemset(gb, 0, (size_t)dim * sizeof(float));
+    cudaMemsetAsync(gw, 0, (size_t)dim * sizeof(float), 0);
+    if (gb) cudaMemsetAsync(gb, 0, (size_t)dim * sizeof(float), 0);
     if (r > 0) k_ln_b<<<r, 256>>>(x, w, gy, gx, gw, gb, r, dim, eps);
 }
 void gs_cu_l2_f(int32_t d, const float *x, float *o, int32_t r, int32_t dim, float eps) {
@@ -734,36 +789,31 @@ void gs_cu_lse_b(int32_t d, const float *x, const float *lse, const float *gy, f
     if (tot > 0) k_lse_b<<<grid1d(tot), 256>>>(x, lse, gy, gx, r, c);
 }
 
-double gs_cu_ce_f(int32_t d, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab, int32_t ignore_idx) {
-    if (rows <= 0) return 0.0;
-    gs_cu_sm_f(d, logits, probs_out, rows, vocab);
+double gs_cu_ce_f(int32_t d, const float *logits, const int32_t *targets, float *lse_out, int32_t *valid_out, int32_t rows, int32_t vocab, int32_t ignore_idx) {
+    if (rows <= 0) {
+        if (valid_out) *valid_out = 0;
+        return 0.0;
+    }
     ensure_scratch(d);
-    cudaMemset(g_reduce_buf, 0, sizeof(float));
-    cudaMemset(g_valid_buf, 0, sizeof(int32_t));
-    int blocks = (rows + 255) / 256;
-    if (blocks > 1024) blocks = 1024;
-    k_ce_fwd_loss<<<blocks, 256>>>(probs_out, targets, g_reduce_buf, g_valid_buf, rows, vocab, ignore_idx);
+    cudaMemsetAsync(g_reduce_buf, 0, sizeof(float), 0);
+    cudaMemsetAsync(g_valid_buf, 0, sizeof(int32_t), 0);
+    k_ce_fused_fwd<<<rows, 256>>>(logits, targets, lse_out, g_reduce_buf, g_valid_buf, rows, vocab, ignore_idx);
     float loss_sum = 0.0f;
     int32_t valid = 0;
     cudaMemcpy(&loss_sum, g_reduce_buf, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&valid, g_valid_buf, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (valid_out) *valid_out = valid;
     return valid > 0 ? (double)loss_sum / (double)valid : 0.0;
 }
 
-void gs_cu_ce_b(int32_t d, const float *probs, const int32_t *targets, float g_loss, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx) {
+void gs_cu_ce_b(int32_t d, const float *logits, const float *lse, const int32_t *targets, float g_loss, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx, int32_t valid) {
     if (rows <= 0) return;
-    ensure_scratch(d);
-    cudaMemset(g_valid_buf, 0, sizeof(int32_t));
-    int blocks = (rows + 255) / 256;
-    if (blocks > 1024) blocks = 1024;
-    k_ce_count_valid<<<blocks, 256>>>(targets, g_valid_buf, rows, vocab, ignore_idx);
-    int32_t valid = 0;
-    cudaMemcpy(&valid, g_valid_buf, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    cudaSetDevice(d);
     if (valid <= 0) {
-        cudaMemset(gl, 0, (size_t)((int64_t)rows * vocab) * sizeof(float));
+        cudaMemsetAsync(gl, 0, (size_t)((int64_t)rows * vocab) * sizeof(float), 0);
         return;
     }
-    k_ce_bwd<<<grid1d((int64_t)rows * vocab), 256>>>(probs, targets, g_loss / (float)valid, gl, rows, vocab, ignore_idx);
+    k_ce_fused_bwd<<<grid1d((int64_t)rows * vocab), 256>>>(logits, lse, targets, g_loss / (float)valid, gl, rows, vocab, ignore_idx);
 }
 
 void gs_cu_emb_f(int32_t d, const float *tab, const int32_t *ids, float *o, int32_t n, int32_t dim) {
@@ -773,7 +823,7 @@ void gs_cu_emb_f(int32_t d, const float *tab, const int32_t *ids, float *o, int3
 }
 void gs_cu_emb_b(int32_t d, const int32_t *ids, const float *gy, float *gtab, int32_t n, int32_t v, int32_t dim) {
     cudaSetDevice(d);
-    cudaMemset(gtab, 0, (size_t)((int64_t)v * dim) * sizeof(float));
+    cudaMemsetAsync(gtab, 0, (size_t)((int64_t)v * dim) * sizeof(float), 0);
     int64_t tot = (int64_t)n * dim;
     if (tot > 0) k_emb_b<<<grid1d(tot), 256>>>(ids, gy, gtab, n, v, dim);
 }

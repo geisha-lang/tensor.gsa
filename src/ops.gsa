@@ -504,7 +504,7 @@ pub def catAxis(xs: List Tensor, axis: Int): Tensor = match xs {
         let outDim = cellGet(totalDim);
         let outSh = setAt(first.shape, ax, outDim);
         let (outer, _, inner) = axisOuterInner(outSh, ax);
-        let out = allocTensorOn(outSh, first.device);
+        let out = zerosOn(outSh, first.device);
         let off = cellNew(0);
         let cur2 = cellNew(xs);
         while (match cellGet(cur2) { Nil -> false, _ -> true }) {
@@ -723,16 +723,16 @@ pub def logSoftmax(x: Tensor): Tensor = sub(x, unsqueeze(logSumExpLast(x), -1))
 pub def crossEntropyIgnore(logits: Tensor, targets: IntTensor, ignoreIndex: Int): Tensor = {
     let vocab = dimAt(logits.shape, listLen(logits.shape) - 1);
     let rows = logits.numel / vocab;
-    let probs = allocTensorOn(logits.shape, logits.device);
-    let lossVal = if (isCuda(logits.device)) cudaCrossEntropyFwd(devId(logits.device), logits.buf, targets.buf, probs.buf, rows, vocab, ignoreIndex)
-                  else { syncDevice(logits.device); cpuCrossEntropyFwd(logits.buf, targets.buf, probs.buf, rows, vocab, ignoreIndex) };
+    let lse = allocTensorOn([rows], logits.device);
+    let (lossVal, valid) = if (isCuda(logits.device)) cudaCrossEntropyFwd(devId(logits.device), logits.buf, targets.buf, lse.buf, rows, vocab, ignoreIndex)
+                           else { syncDevice(logits.device); cpuCrossEntropyFwd(logits.buf, targets.buf, lse.buf, rows, vocab, ignoreIndex) };
     let out = fullOn([1], lossVal, logits.device);
     let lid = logits.nodeId;
-    let lShape = logits.shape;
+    let ld = detach(logits);
     customVjp([lid], out, (g: Tensor) -> {
-        let gl = allocTensorOn(lShape, logits.device);
-        if (isCuda(logits.device)) cudaCrossEntropyBwd(devId(logits.device), probs.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex)
-        else { syncDevice(logits.device); cpuCrossEntropyBwd(probs.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex) };
+        let gl = allocTensorOn(ld.shape, ld.device);
+        if (isCuda(ld.device)) cudaCrossEntropyBwd(devId(ld.device), ld.buf, lse.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex, valid)
+        else { syncDevice(ld.device); cpuCrossEntropyBwd(ld.buf, lse.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex, valid) };
         [(lid, gl)]
     })
 }

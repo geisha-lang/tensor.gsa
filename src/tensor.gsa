@@ -8,7 +8,7 @@ use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaAvailable, aut
 use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
 use tensor.metal.{metalAllocShared, metalSync, metalScaleOrAxpy}
 use tensor.cuda.{
-    cudaAllocBuf, cudaSync, cudaH2d, cudaD2h, cudaD2d,
+    cudaAllocBuf, cudaZero, cudaSync, cudaH2d, cudaD2h, cudaD2d,
     cudaFill, cudaCopy, cudaRandn, cudaAxpy, cudaAdamwStep
 }
 
@@ -242,7 +242,14 @@ pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
     }
 }
 
-pub def zerosOn(sh: List Int, dev: Device): Tensor = allocTensorOn(sh, dev)
+pub def zerosOn(sh: List Int, dev: Device): Tensor = {
+    let t = allocTensorOn(sh, dev);
+    match dev {
+        Cuda(id) -> cudaZero(id, t.buf, intToI64(t.numel) * intToI64(4)),
+        _ -> (),
+    };
+    t
+}
 pub def zeros(sh: List Int): Tensor = zerosOn(sh, Cpu)
 
 pub def fullOn(sh: List Int, val: Float, dev: Device): Tensor = {

@@ -855,74 +855,90 @@ pub def cpuLogSumExpBwd(x: ForeignPtr, lse: ForeignPtr, gy: ForeignPtr, gx: Fore
         )
     )
 
-pub def cpuCrossEntropyFwd(logits: ForeignPtr, targets: ForeignPtr, probs: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float = {
-    cpuSoftmaxFwd(logits, probs, rows, vocab);
-    withForeignPtr(probs, (pp) ->
-        withForeignPtr(targets, (pt) -> {
-            let loss = cellNew(0.0);
-            let valid = cellNew(0);
-            let eps = floatToF32(1.0e-12);
-            let r = cellNew(0);
-            while (cellGet(r) < rows) {
-                let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
-                if (tgt != ignoreIdx && tgt >= 0 && tgt < vocab) {
-                    let p = scopedPtrReadF32Le(pp, (cellGet(r) * vocab + tgt) * 4);
-                    cellSet(loss, cellGet(loss) - f32ToFloat(mathLogF32(p + eps)));
-                    cellSet(valid, cellGet(valid) + 1)
-                } else ();
-                cellSet(r, cellGet(r) + 1)
-            };
-            if (cellGet(valid) > 0) cellGet(loss) / intToFloat(cellGet(valid)) else 0.0
-        })
+pub def cpuCrossEntropyFwd(logits: ForeignPtr, targets: ForeignPtr, lseOut: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): (Float, Int) =
+    withForeignPtr(logits, (px) ->
+        withForeignPtr(targets, (pt) ->
+            withForeignPtr(lseOut, (pl) -> {
+                let loss = cellNew(0.0);
+                let valid = cellNew(0);
+                let zero = floatToF32(0.0);
+                let r = cellNew(0);
+                while (cellGet(r) < rows) {
+                    let ri = cellGet(r);
+                    let tgt = scopedPtrReadI32Le(pt, ri * 4);
+                    if (tgt != ignoreIdx && tgt >= 0 && tgt < vocab) {
+                        let base = ri * vocab;
+                        let mx = cellNew(scopedPtrReadF32Le(px, base * 4));
+                        let c = cellNew(1);
+                        while (cellGet(c) < vocab) {
+                            let v = scopedPtrReadF32Le(px, (base + cellGet(c)) * 4);
+                            if (v > cellGet(mx)) cellSet(mx, v) else ();
+                            cellSet(c, cellGet(c) + 1)
+                        };
+                        let m = cellGet(mx);
+                        let sum = cellNew(0.0);
+                        let c2 = cellNew(0);
+                        while (cellGet(c2) < vocab) {
+                            let e = mathExpF32(scopedPtrReadF32Le(px, (base + cellGet(c2)) * 4) - m);
+                            cellSet(sum, cellGet(sum) + f32ToFloat(e));
+                            cellSet(c2, cellGet(c2) + 1)
+                        };
+                        let lse = m + mathLogF32(floatToF32(cellGet(sum)));
+                        scopedPtrWriteF32Le(pl, ri * 4, lse);
+                        let xt = scopedPtrReadF32Le(px, (base + tgt) * 4);
+                        cellSet(loss, cellGet(loss) + f32ToFloat(lse - xt));
+                        cellSet(valid, cellGet(valid) + 1)
+                    } else {
+                        scopedPtrWriteF32Le(pl, ri * 4, zero)
+                    };
+                    cellSet(r, ri + 1)
+                };
+                let vCnt = cellGet(valid);
+                (if (vCnt > 0) cellGet(loss) / intToFloat(vCnt) else 0.0, vCnt)
+            })
+        )
     )
-}
 
-pub def cpuCrossEntropyBwd(probs: ForeignPtr, targets: ForeignPtr, gLoss: Float, gLogits: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void = {
-    let valid = withForeignPtr(targets, (pt) -> {
-        let cnt = cellNew(0);
-        let r = cellNew(0);
-        while (cellGet(r) < rows) {
-            let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
-            if (tgt != ignoreIdx && tgt >= 0 && tgt < vocab) cellSet(cnt, cellGet(cnt) + 1) else ();
-            cellSet(r, cellGet(r) + 1)
-        };
-        cellGet(cnt)
-    });
+pub def cpuCrossEntropyBwd(logits: ForeignPtr, lse: ForeignPtr, targets: ForeignPtr, gLoss: Float, gLogits: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int, valid: Int): Void =
     if (valid <= 0) {
         cpuFill(gLogits, rows * vocab, floatToF32(0.0))
     } else {
         let sc = floatToF32(gLoss / intToFloat(valid));
         let zero = floatToF32(0.0);
-        withForeignPtr(probs, (pp) ->
-            withForeignPtr(targets, (pt) ->
-                withForeignPtr(gLogits, (pg) -> {
-                    let r = cellNew(0);
-                    while (cellGet(r) < rows) {
-                        let base = cellGet(r) * vocab;
-                        let tgt = scopedPtrReadI32Le(pt, cellGet(r) * 4);
-                        if (tgt == ignoreIdx || tgt < 0 || tgt >= vocab) {
-                            let c = cellNew(0);
-                            while (cellGet(c) < vocab) {
-                                scopedPtrWriteF32Le(pg, (base + cellGet(c)) * 4, zero);
-                                cellSet(c, cellGet(c) + 1)
-                            }
-                        } else {
-                            let c = cellNew(0);
-                            while (cellGet(c) < vocab) {
-                                let off = (base + cellGet(c)) * 4;
-                                scopedPtrWriteF32Le(pg, off, scopedPtrReadF32Le(pp, off) * sc);
-                                cellSet(c, cellGet(c) + 1)
+        withForeignPtr(logits, (px) ->
+            withForeignPtr(lse, (pl) ->
+                withForeignPtr(targets, (pt) ->
+                    withForeignPtr(gLogits, (pg) -> {
+                        let r = cellNew(0);
+                        while (cellGet(r) < rows) {
+                            let ri = cellGet(r);
+                            let base = ri * vocab;
+                            let tgt = scopedPtrReadI32Le(pt, ri * 4);
+                            if (tgt == ignoreIdx || tgt < 0 || tgt >= vocab) {
+                                let c = cellNew(0);
+                                while (cellGet(c) < vocab) {
+                                    scopedPtrWriteF32Le(pg, (base + cellGet(c)) * 4, zero);
+                                    cellSet(c, cellGet(c) + 1)
+                                }
+                            } else {
+                                let lr = scopedPtrReadF32Le(pl, ri * 4);
+                                let c = cellNew(0);
+                                while (cellGet(c) < vocab) {
+                                    let off = (base + cellGet(c)) * 4;
+                                    let p = mathExpF32(scopedPtrReadF32Le(px, off) - lr);
+                                    scopedPtrWriteF32Le(pg, off, p * sc);
+                                    cellSet(c, cellGet(c) + 1)
+                                };
+                                let toff = (base + tgt) * 4;
+                                scopedPtrWriteF32Le(pg, toff, scopedPtrReadF32Le(pg, toff) - sc)
                             };
-                            let toff = (base + tgt) * 4;
-                            scopedPtrWriteF32Le(pg, toff, scopedPtrReadF32Le(pg, toff) - sc)
-                        };
-                        cellSet(r, cellGet(r) + 1)
-                    }
-                })
+                            cellSet(r, ri + 1)
+                        }
+                    })
+                )
             )
         )
     }
-}
 
 pub def cpuEmbeddingFwd(table: ForeignPtr, ids: ForeignPtr, out: ForeignPtr, nIds: Int, dim: Int): Void =
     withForeignPtr(table, (pt) ->

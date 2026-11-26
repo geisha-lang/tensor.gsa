@@ -8,8 +8,10 @@
 #define WEAK __attribute__((weak))
 
 WEAK int32_t gs_cu_device_count(void) { return 0; }
+WEAK void gs_cu_set_bf16(int32_t enabled) { (void)enabled; }
 WEAK void *gs_cu_free_fn(void) { return NULL; }
 WEAK void *gs_cu_alloc(int32_t d, int64_t n) { (void)d; (void)n; return NULL; }
+WEAK void gs_cu_zero(int32_t d, void *p, int64_t n) { (void)d; (void)p; (void)n; }
 WEAK void gs_cu_free(void *p) { (void)p; }
 WEAK void gs_cu_sync(int32_t d) { (void)d; }
 WEAK void gs_cu_h2d(int32_t d, void *dst, const void *src, int64_t n) { (void)d;(void)dst;(void)src;(void)n; }
@@ -49,8 +51,8 @@ WEAK void gs_cu_sm_f(int32_t d, const float *x, float *o, int32_t r, int32_t c) 
 WEAK void gs_cu_sm_b(int32_t d, const float *y, const float *gy, float *gx, int32_t r, int32_t c) { (void)d;(void)y;(void)gy;(void)gx;(void)r;(void)c; }
 WEAK void gs_cu_lse_f(int32_t d, const float *x, float *o, int32_t r, int32_t c) { (void)d;(void)x;(void)o;(void)r;(void)c; }
 WEAK void gs_cu_lse_b(int32_t d, const float *x, const float *lse, const float *gy, float *gx, int32_t r, int32_t c) { (void)d;(void)x;(void)lse;(void)gy;(void)gx;(void)r;(void)c; }
-WEAK double gs_cu_ce_f(int32_t d, const float *logits, const int32_t *targets, float *probs_out, int32_t rows, int32_t vocab, int32_t ignore_idx) { (void)d;(void)logits;(void)targets;(void)probs_out;(void)rows;(void)vocab;(void)ignore_idx; return 0.0; }
-WEAK void gs_cu_ce_b(int32_t d, const float *probs, const int32_t *targets, float g_loss, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx) { (void)d;(void)probs;(void)targets;(void)g_loss;(void)gl;(void)rows;(void)vocab;(void)ignore_idx; }
+WEAK double gs_cu_ce_f(int32_t d, const float *logits, const int32_t *targets, float *lse_out, int32_t *valid_out, int32_t rows, int32_t vocab, int32_t ignore_idx) { (void)d;(void)logits;(void)targets;(void)lse_out;(void)rows;(void)vocab;(void)ignore_idx; if (valid_out) *valid_out = 0; return 0.0; }
+WEAK void gs_cu_ce_b(int32_t d, const float *logits, const float *lse, const int32_t *targets, float g_loss, float *gl, int32_t rows, int32_t vocab, int32_t ignore_idx, int32_t valid) { (void)d;(void)logits;(void)lse;(void)targets;(void)g_loss;(void)gl;(void)rows;(void)vocab;(void)ignore_idx;(void)valid; }
 WEAK void gs_cu_emb_f(int32_t d, const float *tab, const int32_t *ids, float *o, int32_t n, int32_t dim) { (void)d;(void)tab;(void)ids;(void)o;(void)n;(void)dim; }
 WEAK void gs_cu_emb_b(int32_t d, const int32_t *ids, const float *gy, float *gtab, int32_t n, int32_t v, int32_t dim) { (void)d;(void)ids;(void)gy;(void)gtab;(void)n;(void)v;(void)dim; }
 WEAK void gs_cu_rope_f(int32_t d, const float *x, float *o, int32_t b, int32_t s, int32_t h, int32_t hd, float th) { (void)d;(void)x;(void)o;(void)b;(void)s;(void)h;(void)hd;(void)th; }

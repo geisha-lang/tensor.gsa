@@ -6,8 +6,10 @@
 // Only blocking sync / D2H / H2D / host-compute calls use regular `extern`.
 
 extern noalloc "gs_cu_device_count" def c_cu_device_count(): Int
+extern noalloc "gs_cu_set_bf16" def c_cu_set_bf16(enabled: Int): Void
 extern noalloc "gs_cu_free_fn" def c_cu_free_fn(): Ptr
 extern noalloc "gs_cu_alloc" def c_cu_alloc(dev: Int, nbytes: Int64): Ptr
+extern noalloc "gs_cu_zero" def c_cu_zero(dev: Int, ptr: ScopedPtr, nbytes: Int64): Void
 extern "gs_cu_sync" def c_cu_sync(dev: Int): Void
 extern "gs_cu_h2d" def c_cu_h2d(dev: Int, dst: ScopedPtr, src: ScopedPtr, nbytes: Int64): Void
 extern "gs_cu_d2h" def c_cu_d2h(dev: Int, dst: ScopedPtr, src: ScopedPtr, nbytes: Int64): Void
@@ -64,8 +66,8 @@ extern noalloc "gs_cu_sm_f" def c_cu_sm_f(dev: Int, x: ScopedPtr, o: ScopedPtr, 
 extern noalloc "gs_cu_sm_b" def c_cu_sm_b(dev: Int, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
 extern noalloc "gs_cu_lse_f" def c_cu_lse_f(dev: Int, x: ScopedPtr, o: ScopedPtr, rows: Int, cols: Int): Void
 extern noalloc "gs_cu_lse_b" def c_cu_lse_b(dev: Int, x: ScopedPtr, lse: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
-extern "gs_cu_ce_f" def c_cu_ce_f(dev: Int, logits: ScopedPtr, targets: ScopedPtr, probsOut: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float
-extern "gs_cu_ce_b" def c_cu_ce_b(dev: Int, probs: ScopedPtr, targets: ScopedPtr, gLoss: Float32, gl: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void
+extern "gs_cu_ce_f" def c_cu_ce_f(dev: Int, logits: ScopedPtr, targets: ScopedPtr, lseOut: ScopedPtr, validOut: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float
+extern noalloc "gs_cu_ce_b" def c_cu_ce_b(dev: Int, logits: ScopedPtr, lse: ScopedPtr, targets: ScopedPtr, gLoss: Float32, gl: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int, valid: Int): Void
 extern noalloc "gs_cu_emb_f" def c_cu_emb_f(dev: Int, tab: ScopedPtr, ids: ScopedPtr, o: ScopedPtr, nIds: Int, dim: Int): Void
 extern noalloc "gs_cu_emb_b" def c_cu_emb_b(dev: Int, ids: ScopedPtr, gy: ScopedPtr, gtab: ScopedPtr, nIds: Int, vocab: Int, dim: Int): Void
 extern noalloc "gs_cu_rope_f" def c_cu_rope_f(dev: Int, x: ScopedPtr, o: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, th: Float32): Void
@@ -93,12 +95,16 @@ extern "gs_cu_adamw_batch_run" def c_cu_adamw_batch_run(
 // ============================================================================
 
 pub def cudaDeviceCount(): Int = c_cu_device_count()
+pub def setCudaBf16(enabled: Bool): Void = c_cu_set_bf16(if (enabled) 1 else 0)
 
 pub def cudaAllocBuf(dev: Int, nbytes: Int64): ForeignPtr = {
     let nb = if (nbytes > intToI64(0)) nbytes else intToI64(4);
     let ptr = c_cu_alloc(dev, nb);
     foreignPtrNew(ptr, c_cu_free_fn(), nb)
 }
+
+pub def cudaZero(dev: Int, dst: ForeignPtr, nbytes: Int64): Void =
+    if (nbytes > intToI64(0)) c_cu_zero(dev, dst, nbytes) else ()
 
 pub def cudaSync(dev: Int): Void = c_cu_sync(dev)
 
@@ -154,8 +160,14 @@ pub def cudaSoftmaxFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, rows: Int, cols: 
 pub def cudaSoftmaxBwd(dev: Int, y: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void = c_cu_sm_b(dev, y, gy, gx, rows, cols)
 pub def cudaLogSumExpFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, rows: Int, cols: Int): Void = c_cu_lse_f(dev, x, o, rows, cols)
 pub def cudaLogSumExpBwd(dev: Int, x: ForeignPtr, lse: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void = c_cu_lse_b(dev, x, lse, gy, gx, rows, cols)
-pub def cudaCrossEntropyFwd(dev: Int, logits: ForeignPtr, targets: ForeignPtr, probsOut: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float = c_cu_ce_f(dev, logits, targets, probsOut, rows, vocab, ignoreIdx)
-pub def cudaCrossEntropyBwd(dev: Int, probs: ForeignPtr, targets: ForeignPtr, gLoss: Float, gl: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void = c_cu_ce_b(dev, probs, targets, floatToF32(gLoss), gl, rows, vocab, ignoreIdx)
+pub def cudaCrossEntropyFwd(dev: Int, logits: ForeignPtr, targets: ForeignPtr, lseOut: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): (Float, Int) =
+    withAlloca(4, (vp) -> {
+        let loss = c_cu_ce_f(dev, logits, targets, lseOut, vp, rows, vocab, ignoreIdx);
+        let valid = scopedPtrReadI32Le(vp, 0);
+        (loss, valid)
+    })
+pub def cudaCrossEntropyBwd(dev: Int, logits: ForeignPtr, lse: ForeignPtr, targets: ForeignPtr, gLoss: Float, gl: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int, valid: Int): Void =
+    c_cu_ce_b(dev, logits, lse, targets, floatToF32(gLoss), gl, rows, vocab, ignoreIdx, valid)
 pub def cudaEmbeddingFwd(dev: Int, tab: ForeignPtr, ids: ForeignPtr, o: ForeignPtr, nIds: Int, dim: Int): Void = c_cu_emb_f(dev, tab, ids, o, nIds, dim)
 pub def cudaEmbeddingBwd(dev: Int, ids: ForeignPtr, gy: ForeignPtr, gtab: ForeignPtr, nIds: Int, vocab: Int, dim: Int): Void = c_cu_emb_b(dev, ids, gy, gtab, nIds, vocab, dim)
 pub def cudaRope(dev: Int, x: ForeignPtr, o: ForeignPtr, b: Int, s: Int, h: Int, hd: Int, th: Float, bwd: Bool): Void =
