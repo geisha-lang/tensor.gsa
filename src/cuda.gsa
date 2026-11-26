@@ -26,6 +26,7 @@ extern noalloc "gs_cu_bgemm" def c_cu_bgemm(
 
 extern noalloc "gs_cu_fill" def c_cu_fill(dev: Int, dst: ScopedPtr, n: Int64, v: Float32): Void
 extern noalloc "gs_cu_copy" def c_cu_copy(dev: Int, dst: ScopedPtr, src: ScopedPtr, n: Int64): Void
+extern noalloc "gs_cu_copy_at" def c_cu_copy_at(dev: Int, dst: ScopedPtr, dstOff: Int64, src: ScopedPtr, srcOff: Int64, n: Int64): Void
 extern noalloc "gs_cu_binop_same" def c_cu_binop_same(dev: Int, op: Int, a: ScopedPtr, b: ScopedPtr, o: ScopedPtr, n: Int64): Void
 extern noalloc "gs_cu_scale" def c_cu_scale(dev: Int, a: ScopedPtr, s: Float32, o: ScopedPtr, n: Int64): Void
 extern noalloc "gs_cu_add_s" def c_cu_add_s(dev: Int, a: ScopedPtr, s: Float32, o: ScopedPtr, n: Int64): Void
@@ -95,6 +96,9 @@ extern noalloc "gs_cu_jit_launch_reset" def c_cu_jit_launch_reset(): Void
 extern noalloc "gs_cu_jit_launch_push_in" def c_cu_jit_launch_push_in(p: ScopedPtr): Void
 extern noalloc "gs_cu_jit_launch_push_sc" def c_cu_jit_launch_push_sc(v: Float32): Void
 extern noalloc "gs_cu_jit_launch_run" def c_cu_jit_launch_run(dev: Int, fn: Ptr, out: ScopedPtr, n: Int): Void
+extern noalloc "gs_cu_gradclip_batch_reset" def c_cu_gradclip_batch_reset(): Void
+extern noalloc "gs_cu_gradclip_batch_push" def c_cu_gradclip_batch_push(g: ScopedPtr, go: ScopedPtr, n: Int64): Void
+extern noalloc "gs_cu_gradclip_batch_run" def c_cu_gradclip_batch_run(dev: Int, maxNorm: Float32): Void
 
 // ============================================================================
 // Public Geisha Wrappers
@@ -131,6 +135,8 @@ pub def cudaBgemm(dev: Int, batch: Int, ta: Bool, tb: Bool, m: Int, n: Int, k: I
 
 pub def cudaFill(dev: Int, dst: ForeignPtr, n: Int, v: Float32): Void = c_cu_fill(dev, dst, intToI64(n), v)
 pub def cudaCopy(dev: Int, dst: ForeignPtr, src: ForeignPtr, n: Int): Void = c_cu_copy(dev, dst, src, intToI64(n))
+pub def cudaCopyAt(dev: Int, dst: ForeignPtr, dstOff: Int, src: ForeignPtr, srcOff: Int, n: Int): Void =
+    c_cu_copy_at(dev, dst, intToI64(dstOff), src, intToI64(srcOff), intToI64(n))
 pub def cudaBinopSame(dev: Int, op: Int, a: ForeignPtr, b: ForeignPtr, o: ForeignPtr, n: Int): Void = c_cu_binop_same(dev, op, a, b, o, intToI64(n))
 pub def cudaScale(dev: Int, a: ForeignPtr, s: Float32, o: ForeignPtr, n: Int): Void = c_cu_scale(dev, a, s, o, intToI64(n))
 pub def cudaAddScalar(dev: Int, a: ForeignPtr, s: Float32, o: ForeignPtr, n: Int): Void = c_cu_add_s(dev, a, s, o, intToI64(n))
@@ -204,3 +210,7 @@ pub def cudaJitLaunchReset(): Void = c_cu_jit_launch_reset()
 pub def cudaJitLaunchPushIn(p: ForeignPtr): Void = c_cu_jit_launch_push_in(p)
 pub def cudaJitLaunchPushSc(v: Float32): Void = c_cu_jit_launch_push_sc(v)
 pub def cudaJitLaunchRun(dev: Int, fn: Ptr, out: ForeignPtr, n: Int): Void = c_cu_jit_launch_run(dev, fn, out, n)
+
+pub def cudaGradClipBatchReset(): Void = c_cu_gradclip_batch_reset()
+pub def cudaGradClipBatchPush(g: ForeignPtr, go: ForeignPtr, n: Int): Void = c_cu_gradclip_batch_push(g, go, intToI64(n))
+pub def cudaGradClipBatchRun(dev: Int, maxNorm: Float): Void = c_cu_gradclip_batch_run(dev, floatToF32(maxNorm))

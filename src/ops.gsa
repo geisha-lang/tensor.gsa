@@ -3,9 +3,10 @@
 
 use std.option.{Option, Some, None}
 use std.list.{listLen, listRev}
+use std.vec.{vecNew, vecPush, vecGet}
 use tensor.backend.{Device, Cpu, devId, sgemmCpu, bgemmCpu}
 use tensor.cpu.{
-    cpuBinopSame, cpuScale, cpuAddScalar, cpuPowScalarFwd, cpuPowScalarBwd,
+    cpuCopyAt, cpuBinopSame, cpuScale, cpuAddScalar, cpuPowScalarFwd, cpuPowScalarBwd,
     cpuClampFwd, cpuClampBwd, cpuLeakyReluFwd, cpuLeakyReluBwd,
     cpuBcastBinop, cpuBcastReduceSum, cpuUnaryFwd, cpuUnaryBwd,
     cpuSliceAxisFwd, cpuSliceAxisBwd, cpuSumAxis, cpuMaxAxis, cpuSumAll, cpuSumSq,
@@ -16,7 +17,7 @@ use tensor.cpu.{
     cpuTranspose2d, cpuTranspose0213, cpuCausalMaskAdd
 }
 use tensor.cuda.{
-    cudaSgemm, cudaBgemm, cudaBinopSame, cudaScale, cudaAddScalar,
+    cudaCopyAt, cudaSgemm, cudaBgemm, cudaBinopSame, cudaScale, cudaAddScalar,
     cudaPowScalarFwd, cudaPowScalarBwd, cudaClampFwd, cudaClampBwd,
     cudaLeakyReluFwd, cudaLeakyReluBwd, cudaBcastBinop, cudaBcastReduceSum,
     cudaUnaryFwd, cudaUnaryBwd, cudaSliceAxisFwd, cudaSliceAxisBwd,
@@ -273,10 +274,13 @@ def replaceLastDim(sh: List Int, newLast: Int): List Int = match sh {
     Cons(h, r) -> Cons(h, replaceLastDim(r, newLast)),
 }
 
+def dispatchSgemmBeta(ta: Bool, tb: Bool, m: Int, n: Int, k: Int, beta: Float, a: Tensor, b: Tensor, out: Tensor): Void =
+    if (isCuda(a.device)) cudaSgemm(devId(a.device), ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(beta), out.buf)
+    else if (isMetal(a.device)) metalSgemm(ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, beta, out.gpuBuf)
+    else sgemmCpu(ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(beta), out.buf)
+
 def dispatchSgemm(ta: Bool, tb: Bool, m: Int, n: Int, k: Int, a: Tensor, b: Tensor, out: Tensor): Void =
-    if (isCuda(a.device)) cudaSgemm(devId(a.device), ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
-    else if (isMetal(a.device)) metalSgemm(ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, 0.0, out.gpuBuf)
-    else sgemmCpu(ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
+    dispatchSgemmBeta(ta, tb, m, n, k, 0.0, a, b, out)
 
 def dispatchBgemm(batch: Int, ta: Bool, tb: Bool, m: Int, n: Int, k: Int, a: Tensor, b: Tensor, out: Tensor): Void =
     if (isCuda(a.device)) cudaBgemm(devId(a.device), batch, ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
@@ -745,6 +749,85 @@ pub def crossEntropyIgnore(logits: Tensor, targets: IntTensor, ignoreIndex: Int)
 
 pub def crossEntropy(logits: Tensor, targets: IntTensor): Tensor =
     crossEntropyIgnore(logits, targets, -100)
+
+def copyAtDevice(dev: Device, dst: ForeignPtr, dstOff: Int, src: ForeignPtr, srcOff: Int, n: Int): Void =
+    if (isCuda(dev)) cudaCopyAt(devId(dev), dst, dstOff, src, srcOff, n)
+    else { syncDevice(dev); cpuCopyAt(dst, dstOff, src, srcOff, n) }
+
+// Chunked / Cut Cross-Entropy: computes `crossEntropyIgnore(matmulNT(h, w), targets, ignoreIndex)`
+// in chunks of `chunkRows` rows without ever materializing full `[rows, vocab]` logits/gLogits!
+pub def fusedLinearCrossEntropyChunked(h: Tensor, w: Tensor, targets: IntTensor, ignoreIndex: Int, chunkRows: Int): Tensor = {
+    let vocab = dimAt(w.shape, 0);
+    let dim = dimAt(w.shape, 1);
+    let rows = h.numel / dim;
+    let dev = h.device;
+    let csz = if (chunkRows > 0 && chunkRows < rows) chunkRows else rows;
+    let lseChunks = vecNew();
+    let totalLoss = cellNew(0.0);
+    let totalValid = cellNew(0);
+
+    let logitsBuf = allocTensorOn([csz, vocab], dev);
+    let hChunkBuf = allocTensorOn([csz, dim], dev);
+    let tChunkBuf = allocTensorOn([csz], dev);
+
+    let off = cellNew(0);
+    while (cellGet(off) < rows) {
+        let start = cellGet(off);
+        let cur = if (start + csz <= rows) csz else rows - start;
+        copyAtDevice(dev, hChunkBuf.buf, 0, h.buf, start * dim, cur * dim);
+        copyAtDevice(dev, tChunkBuf.buf, 0, targets.buf, start, cur);
+        dispatchSgemm(false, true, cur, vocab, dim, hChunkBuf, w, logitsBuf);
+        let lseC = allocTensorOn([cur], dev);
+        let (lossC, validC) = if (isCuda(dev)) cudaCrossEntropyFwd(devId(dev), logitsBuf.buf, tChunkBuf.buf, lseC.buf, cur, vocab, ignoreIndex)
+                              else { syncDevice(dev); cpuCrossEntropyFwd(logitsBuf.buf, tChunkBuf.buf, lseC.buf, cur, vocab, ignoreIndex) };
+        cellSet(totalLoss, cellGet(totalLoss) + lossC * intToFloat(validC));
+        cellSet(totalValid, cellGet(totalValid) + validC);
+        vecPush(lseChunks, lseC);
+        cellSet(off, start + cur)
+    };
+
+    let validAll = cellGet(totalValid);
+    let meanLoss = if (validAll > 0) cellGet(totalLoss) / intToFloat(validAll) else 0.0;
+    let out = fullOn([1], meanLoss, dev);
+    let hid = h.nodeId;
+    let wid = w.nodeId;
+    let hd = detach(h);
+    let wd = detach(w);
+    customVjp([hid, wid], out, (g: Tensor) -> {
+        let gLoss = item(g);
+        let gh = allocTensorOn(hd.shape, dev);
+        let gw = zerosOn(wd.shape, dev);
+        let bLogits = allocTensorOn([csz, vocab], dev);
+        let bH = allocTensorOn([csz, dim], dev);
+        let bT = allocTensorOn([csz], dev);
+        let bGh = allocTensorOn([csz, dim], dev);
+        let boff = cellNew(0);
+        let cidx = cellNew(0);
+        while (cellGet(boff) < rows) {
+            let start = cellGet(boff);
+            let cur = if (start + csz <= rows) csz else rows - start;
+            copyAtDevice(dev, bH.buf, 0, hd.buf, start * dim, cur * dim);
+            copyAtDevice(dev, bT.buf, 0, targets.buf, start, cur);
+            dispatchSgemm(false, true, cur, vocab, dim, bH, wd, bLogits);
+            match vecGet(lseChunks, cellGet(cidx)) {
+                Some(lseC) -> {
+                    if (isCuda(dev)) cudaCrossEntropyBwd(devId(dev), bLogits.buf, lseC.buf, bT.buf, gLoss, bLogits.buf, cur, vocab, ignoreIndex, validAll)
+                    else { syncDevice(dev); cpuCrossEntropyBwd(bLogits.buf, lseC.buf, bT.buf, gLoss, bLogits.buf, cur, vocab, ignoreIndex, validAll) }
+                },
+                None -> (),
+            };
+            dispatchSgemm(false, false, cur, dim, vocab, bLogits, wd, bGh);
+            copyAtDevice(dev, gh.buf, start * dim, bGh.buf, 0, cur * dim);
+            dispatchSgemmBeta(true, false, vocab, dim, cur, 1.0, bLogits, bH, gw);
+            cellSet(boff, start + cur);
+            cellSet(cidx, cellGet(cidx) + 1)
+        };
+        [(hid, gh), (wid, gw)]
+    })
+}
+
+pub def fusedLinearCrossEntropy(h: Tensor, w: Tensor, targets: IntTensor, ignoreIndex: Int): Tensor =
+    fusedLinearCrossEntropyChunked(h, w, targets, ignoreIndex, 512)
 
 pub def mseLoss(pred: Tensor, target: Tensor): Tensor =
     meanAll(square(sub(pred, target)))

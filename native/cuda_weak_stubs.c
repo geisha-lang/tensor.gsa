@@ -21,6 +21,7 @@ WEAK void gs_cu_sgemm(int32_t d, int32_t ta, int32_t tb, int32_t M, int32_t N, i
 WEAK void gs_cu_bgemm(int32_t d, int32_t batch, int32_t ta, int32_t tb, int32_t M, int32_t N, int32_t K, float a, const float *A, const float *B, float b, float *C) { (void)d;(void)batch;(void)ta;(void)tb;(void)M;(void)N;(void)K;(void)a;(void)A;(void)B;(void)b;(void)C; }
 WEAK void gs_cu_fill(int32_t d, float *dst, int64_t n, float v) { (void)d;(void)dst;(void)n;(void)v; }
 WEAK void gs_cu_copy(int32_t d, float *dst, const float *src, int64_t n) { (void)d;(void)dst;(void)src;(void)n; }
+WEAK void gs_cu_copy_at(int32_t d, float *dst, int64_t dst_off, const float *src, int64_t src_off, int64_t n) { (void)d;(void)dst;(void)dst_off;(void)src;(void)src_off;(void)n; }
 WEAK void gs_cu_binop_same(int32_t d, int32_t op, const float *a, const float *b, float *o, int64_t n) { (void)d;(void)op;(void)a;(void)b;(void)o;(void)n; }
 WEAK void gs_cu_scale(int32_t d, const float *a, float s, float *o, int64_t n) { (void)d;(void)a;(void)s;(void)o;(void)n; }
 WEAK void gs_cu_add_s(int32_t d, const float *a, float s, float *o, int64_t n) { (void)d;(void)a;(void)s;(void)o;(void)n; }
@@ -71,3 +72,6 @@ WEAK void gs_cu_jit_launch_reset(void) {}
 WEAK void gs_cu_jit_launch_push_in(const void *p) { (void)p; }
 WEAK void gs_cu_jit_launch_push_sc(float v) { (void)v; }
 WEAK void gs_cu_jit_launch_run(int32_t d, void *fn, void *out_ptr, int32_t n) { (void)d;(void)fn;(void)out_ptr;(void)n; }
+WEAK void gs_cu_gradclip_batch_reset(void) {}
+WEAK void gs_cu_gradclip_batch_push(const float *g, float *go, int64_t n) { (void)g;(void)go;(void)n; }
+WEAK void gs_cu_gradclip_batch_run(int32_t d, float max_norm) { (void)d;(void)max_norm; }

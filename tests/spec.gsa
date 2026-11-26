@@ -18,7 +18,7 @@ use tensor.tensor.{Tensor, fromList, fromI32List, fromI32ListOn, randnOn, toDevi
 use tensor.ops.{
     add, sub, mul, divT, scale, addScalar, silu, gelu, sigmoid, exp, log, square, clamp,
     rmsNorm, layerNorm, l2NormLast, softmax, logSumExpLast, rope, transpose2d,
-    crossEntropy, crossEntropyIgnore, mseLoss, matmul, matmulNT,
+    crossEntropy, crossEntropyIgnore, fusedLinearCrossEntropyChunked, mseLoss, matmul, matmulNT,
     sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
 }
 use tensor.jit.{jit1, jit2, jitCompileCount, jitCacheHits, checkpoint}
@@ -332,6 +332,28 @@ def testJitAndCheckpoint(): Result Void String = {
     let (_, gNormal) = valueAndGrad(x0, (x) -> meanAll(square(silu(matmulNT(x, w)))));
     let (_, gCkpt) = valueAndGrad(x0, (x) -> meanAll(square(checkpoint(x, (h) -> silu(matmulNT(h, w))))));
     let _ = assertTrue("checkpoint_grad_exact", l2NormFloat(gNormal - gCkpt) < 1.0e-5)?;
+
+    // Test Chunked Fused Linear + Cross-Entropy exact parity (loss + gh + gw)
+    let fh = randnOn([10, 8], intToI64(901), 0.5, Cpu);
+    let fw = randnOn([16, 8], intToI64(902), 0.5, Cpu);
+    let ft = fromI32List([10], [1, 3, -100, 5, 7, 2, 0, 15, -100, 4]);
+    let (lRef, gRefList) = valueAndGrad([fh, fw], (xs) -> match xs {
+        Cons(h, Cons(w, _)) -> crossEntropyIgnore(matmulNT(h, w), ft, -100),
+        _ -> meanAll(fh),
+    });
+    let (lFused, gFusedList) = valueAndGrad([fh, fw], (xs) -> match xs {
+        Cons(h, Cons(w, _)) -> fusedLinearCrossEntropyChunked(h, w, ft, -100, 4),
+        _ -> meanAll(fh),
+    });
+    let lDiff = lRef - lFused;
+    let _ = assertTrue("fused_linear_ce_loss_exact", (if (lDiff < 0.0) -lDiff else lDiff) < 1.0e-5)?;
+    let _ = match (gRefList, gFusedList) {
+        (Cons(ghRef, Cons(gwRef, _)), Cons(ghFused, Cons(gwFused, _))) -> {
+            let _ = assertTrue("fused_linear_ce_gh_exact", l2NormFloat(ghRef - ghFused) < 1.0e-5)?;
+            assertTrue("fused_linear_ce_gw_exact", l2NormFloat(gwRef - gwFused) < 1.0e-5)
+        },
+        _ -> Err("fused_linear_ce_grad_shape"),
+    }?;
     Ok(())
 }
 

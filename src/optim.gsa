@@ -8,7 +8,10 @@ use tensor.backend.{devId}
 use tensor.tensor.{Tensor, zerosLike, allocTensorOn, dimAt, adamwStepRaw, detach, isMetal, isCuda}
 use tensor.cpu.cpuAdamwStep
 use tensor.metal.metalAdamwStep
-use tensor.cuda.{cudaAdamwStep, cudaAdamwBatchReset, cudaAdamwBatchPush, cudaAdamwBatchRun}
+use tensor.cuda.{
+    cudaAdamwStep, cudaAdamwBatchReset, cudaAdamwBatchPush, cudaAdamwBatchRun,
+    cudaGradClipBatchReset, cudaGradClipBatchPush, cudaGradClipBatchRun
+}
 use tensor.ops.{add, mul, scale, matmul, transpose2d, l2NormFloat}
 use tensor.ad.{Params, mapParams, zipParams, collectParams, gradNorm}
 
@@ -17,11 +20,48 @@ use tensor.ad.{Params, mapParams, zipParams, collectParams, gradNorm}
 // ============================================================================
 
 pub def clipGradNorm(grads, maxNorm): forall m. (Params m) => (m, Float) -> m = {
-    let gn = gradNorm(grads);
-    if (gn > maxNorm && gn > 0.0) {
-        let s = maxNorm / (gn + 1.0e-6);
-        mapParams((g) -> scale(detach(g), s), grads)
-    } else grads
+    let gVec = vecNew();
+    collectParams(grads, gVec);
+    let n = vecLen(gVec);
+    let allSameCuda = cellNew(n > 0);
+    let cuDev = cellNew(-1);
+    let chk = cellNew(0);
+    while (cellGet(chk) < n && cellGet(allSameCuda)) {
+        match vecGet(gVec, cellGet(chk)) {
+            Some(g) -> if (isCuda(g.device)) {
+                let d = devId(g.device);
+                if (cellGet(cuDev) < 0) cellSet(cuDev, d)
+                else if (cellGet(cuDev) != d) cellSet(allSameCuda, false)
+                else ()
+            } else cellSet(allSameCuda, false),
+            None -> cellSet(allSameCuda, false),
+        };
+        cellSet(chk, cellGet(chk) + 1)
+    };
+    if (cellGet(allSameCuda)) {
+        let outVec = vecNew();
+        cudaGradClipBatchReset();
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            match vecGet(gVec, cellGet(i)) {
+                Some(g) -> {
+                    let gOut = allocTensorOn(g.shape, g.device);
+                    cudaGradClipBatchPush(g.buf, gOut.buf, g.numel);
+                    vecPush(outVec, gOut)
+                },
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        cudaGradClipBatchRun(cellGet(cuDev), maxNorm);
+        rebuildFromVec(grads, outVec)
+    } else {
+        let gn = gradNorm(grads);
+        if (gn > maxNorm && gn > 0.0) {
+            let s = maxNorm / (gn + 1.0e-6);
+            mapParams((g) -> scale(detach(g), s), grads)
+        } else grads
+    }
 }
 
 pub def cosineLr(step: Int, warmupSteps: Int, totalSteps: Int, maxLr: Float, minLr: Float): Float =

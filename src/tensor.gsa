@@ -5,11 +5,11 @@ use std.option.{Option, Some, None}
 use std.list.{listLen, listNth, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
 use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaAvailable, autoDevice}
-use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
-use tensor.metal.{metalAllocShared, metalSync, metalScaleOrAxpy}
+use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuBinopSame, cpuAdamwStep}
+use tensor.metal.{metalAllocShared, metalSync, metalScaleOrAxpy, metalBinopSame}
 use tensor.cuda.{
     cudaAllocBuf, cudaZero, cudaSync, cudaH2d, cudaD2h, cudaD2d,
-    cudaFill, cudaCopy, cudaRandn, cudaAxpy, cudaAdamwStep
+    cudaFill, cudaCopy, cudaRandn, cudaAxpy, cudaBinopSame, cudaAdamwStep
 }
 
 // ============================================================================
@@ -532,9 +532,20 @@ pub def customVjp(inputIds: List Int, out: Tensor, bwdFn: Tensor -> List (Int, T
         },
     }
 
+def addSameRaw(a: Tensor, b: Tensor): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    match a.device {
+        Cuda(id) -> cudaBinopSame(id, 0, a.buf, b.buf, out.buf, a.numel),
+        Metal(_) -> metalBinopSame(0, a.gpuBuf, b.gpuBuf, out.gpuBuf, a.numel),
+        _ -> cpuBinopSame(0, a.buf, b.buf, out.buf, a.numel),
+    };
+    out
+}
+
 pub def runBackwardWithSeed(tp: Tape, loss: Tensor, seedGrad: Tensor): Vec (Option Tensor) = {
     let n = vecLen(tp.nodes);
     let grads = vecNew();
+    let owned = arrayNew(if (n > 0) n else 1, false);
     let i = cellNew(0);
     while (cellGet(i) < n) {
         vecPush(grads, None);
@@ -556,8 +567,15 @@ pub def runBackwardWithSeed(tp: Tape, loss: Tensor, seedGrad: Tensor): Vec (Opti
                             Cons((inId, gIn), rest) -> {
                                 if (inId >= 0 && inId < n) {
                                     match vecGet(grads, inId) {
-                                        Some(Some(existing)) -> axpyInPlace(1.0, gIn, existing),
-                                        _ -> vecSet(grads, inId, Some(cloneTensor(gIn))),
+                                        Some(Some(existing)) ->
+                                            if (arrayGet(owned, inId)) {
+                                                axpyInPlace(1.0, gIn, existing)
+                                            } else {
+                                                let acc = addSameRaw(existing, gIn);
+                                                vecSet(grads, inId, Some(acc));
+                                                arraySet(owned, inId, true)
+                                            },
+                                        _ -> vecSet(grads, inId, Some(gIn)),
                                     }
                                 } else ();
                                 cellSet(cur, rest)

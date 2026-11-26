@@ -29,6 +29,18 @@ pub def cpuCopy(dst: ForeignPtr, src: ForeignPtr, n: Int): Void =
         })
     )
 
+pub def cpuCopyAt(dst: ForeignPtr, dstOff: Int, src: ForeignPtr, srcOff: Int, n: Int): Void =
+    withForeignPtr(dst, (d) ->
+        withForeignPtr(src, (s) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let k = cellGet(i);
+                scopedPtrWriteF32Le(d, (dstOff + k) * 4, scopedPtrReadF32Le(s, (srcOff + k) * 4));
+                cellSet(i, k + 1)
+            }
+        })
+    )
+
 pub def cpuBinopSame(op: Int, a: ForeignPtr, b: ForeignPtr, out: ForeignPtr, n: Int): Void =
     withForeignPtr(a, (pa) ->
         withForeignPtr(b, (pb) ->

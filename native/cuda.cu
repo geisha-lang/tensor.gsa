@@ -181,18 +181,43 @@ __global__ void k_fill(float *d, int64_t n, float v) {
     if (i < n) d[i] = v;
 }
 __global__ void k_binop_same(int32_t op, const float *a, const float *b, float *o, int64_t n) {
-    int64_t i = blockIdx.x * 256LL + threadIdx.x;
-    if (i >= n) return;
-    float va = a[i], vb = b[i];
-    o[i] = (op == 0) ? (va + vb) : (op == 1) ? (va - vb) : (op == 2) ? (va * vb) : (va / vb);
+    int64_t i4 = blockIdx.x * 256LL + threadIdx.x;
+    int64_t n4 = n >> 2;
+    if (i4 < n4) {
+        float4 va = ((const float4 *)a)[i4];
+        float4 vb = ((const float4 *)b)[i4];
+        float4 vo;
+        if (op == 0)      { vo.x = va.x + vb.x; vo.y = va.y + vb.y; vo.z = va.z + vb.z; vo.w = va.w + vb.w; }
+        else if (op == 1) { vo.x = va.x - vb.x; vo.y = va.y - vb.y; vo.z = va.z - vb.z; vo.w = va.w - vb.w; }
+        else if (op == 2) { vo.x = va.x * vb.x; vo.y = va.y * vb.y; vo.z = va.z * vb.z; vo.w = va.w * vb.w; }
+        else              { vo.x = va.x / vb.x; vo.y = va.y / vb.y; vo.z = va.z / vb.z; vo.w = va.w / vb.w; }
+        ((float4 *)o)[i4] = vo;
+    } else if (i4 == n4) {
+        for (int64_t i = n4 << 2; i < n; i++) {
+            float va = a[i], vb = b[i];
+            o[i] = (op == 0) ? (va + vb) : (op == 1) ? (va - vb) : (op == 2) ? (va * vb) : (va / vb);
+        }
+    }
 }
 __global__ void k_scale(const float *a, float s, float *o, int64_t n) {
-    int64_t i = blockIdx.x * 256LL + threadIdx.x;
-    if (i < n) o[i] = a[i] * s;
+    int64_t i4 = blockIdx.x * 256LL + threadIdx.x;
+    int64_t n4 = n >> 2;
+    if (i4 < n4) {
+        float4 va = ((const float4 *)a)[i4];
+        ((float4 *)o)[i4] = make_float4(va.x * s, va.y * s, va.z * s, va.w * s);
+    } else if (i4 == n4) {
+        for (int64_t i = n4 << 2; i < n; i++) o[i] = a[i] * s;
+    }
 }
 __global__ void k_add_s(const float *a, float s, float *o, int64_t n) {
-    int64_t i = blockIdx.x * 256LL + threadIdx.x;
-    if (i < n) o[i] = a[i] + s;
+    int64_t i4 = blockIdx.x * 256LL + threadIdx.x;
+    int64_t n4 = n >> 2;
+    if (i4 < n4) {
+        float4 va = ((const float4 *)a)[i4];
+        ((float4 *)o)[i4] = make_float4(va.x + s, va.y + s, va.z + s, va.w + s);
+    } else if (i4 == n4) {
+        for (int64_t i = n4 << 2; i < n; i++) o[i] = a[i] + s;
+    }
 }
 __global__ void k_pow_f(const float *a, float p, float *o, int64_t n) {
     int64_t i = blockIdx.x * 256LL + threadIdx.x;
@@ -219,8 +244,15 @@ __global__ void k_lrelu_b(const float *a, const float *gy, float s, float *gx, i
     if (i < n) gx[i] = a[i] > 0.0f ? gy[i] : s * gy[i];
 }
 __global__ void k_axpy(float a, const float *x, float *y, int64_t n) {
-    int64_t i = blockIdx.x * 256LL + threadIdx.x;
-    if (i < n) y[i] += a * x[i];
+    int64_t i4 = blockIdx.x * 256LL + threadIdx.x;
+    int64_t n4 = n >> 2;
+    if (i4 < n4) {
+        float4 vx = ((const float4 *)x)[i4];
+        float4 vy = ((float4 *)y)[i4];
+        ((float4 *)y)[i4] = make_float4(vy.x + a * vx.x, vy.y + a * vx.y, vy.z + a * vx.z, vy.w + a * vx.w);
+    } else if (i4 == n4) {
+        for (int64_t i = n4 << 2; i < n; i++) y[i] += a * x[i];
+    }
 }
 
 typedef struct { int32_t sh[8], sa[8], sb[8]; } BcastMeta;
@@ -327,29 +359,45 @@ __global__ void k_max_axis(const float *x, float *o, int32_t outer, int32_t dim,
 // ============================================================================
 
 __device__ inline float block_reduce_sum(float v) {
-    __shared__ float sh[256];
+    __shared__ float sh[8];
     int tid = threadIdx.x;
-    sh[tid] = v;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    if (lane == 0) sh[warp] = v;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) sh[tid] += sh[tid + s];
-        __syncthreads();
+    float res = (tid < 8) ? sh[tid] : 0.0f;
+    if (warp == 0) {
+        for (int off = 4; off > 0; off >>= 1) res += __shfl_down_sync(0xffffffffu, res, off);
+        if (tid == 0) sh[0] = res;
     }
-    float res = sh[0];
+    __syncthreads();
+    res = sh[0];
     __syncthreads();
     return res;
 }
 
 __device__ inline float block_reduce_max(float v) {
-    __shared__ float sh[256];
+    __shared__ float sh[8];
     int tid = threadIdx.x;
-    sh[tid] = v;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s && sh[tid + s] > sh[tid]) sh[tid] = sh[tid + s];
-        __syncthreads();
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = __shfl_down_sync(0xffffffffu, v, off);
+        if (o > v) v = o;
     }
-    float res = sh[0];
+    if (lane == 0) sh[warp] = v;
+    __syncthreads();
+    float res = (tid < 8) ? sh[tid] : -1.0e38f;
+    if (warp == 0) {
+        for (int off = 4; off > 0; off >>= 1) {
+            float o = __shfl_down_sync(0xffffffffu, res, off);
+            if (o > res) res = o;
+        }
+        if (tid == 0) sh[0] = res;
+    }
+    __syncthreads();
+    res = sh[0];
     __syncthreads();
     return res;
 }
@@ -615,6 +663,57 @@ __global__ void k_adamw_multi(
     }
 }
 
+__global__ void k_sum_sq_multi(
+    int32_t count,
+    const float *const *gs,
+    const int64_t *numels,
+    float *out_sum_sq
+) {
+    int32_t t = blockIdx.y;
+    if (t >= count) return;
+    int64_t n = numels[t];
+    const float *g = gs[t];
+    float acc = 0.0f;
+    int64_t n4 = n >> 2;
+    for (int64_t i4 = blockIdx.x * 256LL + threadIdx.x; i4 < n4; i4 += (int64_t)gridDim.x * 256LL) {
+        float4 v = ((const float4 *)g)[i4];
+        acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int64_t i = n4 << 2; i < n; i++) {
+            float v = g[i];
+            acc += v * v;
+        }
+    }
+    float bs = block_reduce_sum(acc);
+    if (threadIdx.x == 0 && bs != 0.0f) atomicAdd(out_sum_sq, bs);
+}
+
+__global__ void k_clip_scale_multi(
+    int32_t count,
+    const float *const *gs,
+    float *const *gos,
+    const int64_t *numels,
+    const float *sum_sq_ptr,
+    float max_norm
+) {
+    int32_t t = blockIdx.y;
+    if (t >= count) return;
+    float gn = sqrtf(*sum_sq_ptr);
+    float s = (gn > max_norm && gn > 0.0f) ? (max_norm / (gn + 1.0e-6f)) : 1.0f;
+    int64_t n = numels[t];
+    const float *g = gs[t];
+    float *go = gos[t];
+    int64_t n4 = n >> 2;
+    for (int64_t i4 = blockIdx.x * 256LL + threadIdx.x; i4 < n4; i4 += (int64_t)gridDim.x * 256LL) {
+        float4 v = ((const float4 *)g)[i4];
+        ((float4 *)go)[i4] = make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int64_t i = n4 << 2; i < n; i++) go[i] = g[i] * s;
+    }
+}
+
 // ============================================================================
 // Exported C ABI Wrappers for `src/cuda.gsa`
 // ============================================================================
@@ -628,17 +727,20 @@ void gs_cu_fill(int32_t d, float *dst, int64_t n, float v) {
 void gs_cu_copy(int32_t d, float *dst, const float *src, int64_t n) {
     gs_cu_d2d(d, dst, src, n * (int64_t)sizeof(float));
 }
+void gs_cu_copy_at(int32_t d, float *dst, int64_t dst_off, const float *src, int64_t src_off, int64_t n) {
+    if (n > 0) gs_cu_d2d(d, dst + dst_off, src + src_off, n * (int64_t)sizeof(float));
+}
 void gs_cu_binop_same(int32_t d, int32_t op, const float *a, const float *b, float *o, int64_t n) {
     cudaSetDevice(d);
-    if (n > 0) k_binop_same<<<grid1d(n), 256>>>(op, a, b, o, n);
+    if (n > 0) k_binop_same<<<grid1d((n >> 2) + 1), 256>>>(op, a, b, o, n);
 }
 void gs_cu_scale(int32_t d, const float *a, float s, float *o, int64_t n) {
     cudaSetDevice(d);
-    if (n > 0) k_scale<<<grid1d(n), 256>>>(a, s, o, n);
+    if (n > 0) k_scale<<<grid1d((n >> 2) + 1), 256>>>(a, s, o, n);
 }
 void gs_cu_add_s(int32_t d, const float *a, float s, float *o, int64_t n) {
     cudaSetDevice(d);
-    if (n > 0) k_add_s<<<grid1d(n), 256>>>(a, s, o, n);
+    if (n > 0) k_add_s<<<grid1d((n >> 2) + 1), 256>>>(a, s, o, n);
 }
 void gs_cu_pow_f(int32_t d, const float *a, float p, float *o, int64_t n) {
     cudaSetDevice(d);
@@ -666,7 +768,7 @@ void gs_cu_lrelu_b(int32_t d, const float *a, const float *gy, float s, float *g
 }
 void gs_cu_axpy(int32_t d, float a, const float *x, float *y, int64_t n) {
     cudaSetDevice(d);
-    if (n > 0) k_axpy<<<grid1d(n), 256>>>(a, x, y, n);
+    if (n > 0) k_axpy<<<grid1d((n >> 2) + 1), 256>>>(a, x, y, n);
 }
 
 void gs_cu_bcast_binop(int32_t d, int32_t op, int32_t ndim, int64_t total, const int32_t *sh, const int32_t *sa, const int32_t *sb, const float *a, const float *b, float *o) {
@@ -1141,6 +1243,99 @@ void gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
     args[k++] = (void *)&g_jit_sc_dev;
     args[k++] = (void *)&n;
     p_cuLaunch(fn, (unsigned int)grid1d(n), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
+}
+
+// ============================================================================
+// Zero-Sync Multi-Tensor Grad Norm Clipping
+// ============================================================================
+
+typedef struct {
+    const float *g;
+    float *go;
+    int64_t n;
+} GradClipItem;
+
+static GradClipItem *g_clip_items = NULL;
+static int32_t g_clip_count = 0;
+static int32_t g_clip_cap = 0;
+static void *g_clip_meta_buf = NULL;
+static size_t g_clip_meta_cap = 0;
+
+void gs_cu_gradclip_batch_reset(void) {
+    g_clip_count = 0;
+}
+
+void gs_cu_gradclip_batch_push(const float *g, float *go, int64_t n) {
+    if (n <= 0) return;
+    if (g_clip_count >= g_clip_cap) {
+        int32_t nc = g_clip_cap > 0 ? g_clip_cap * 2 : 128;
+        GradClipItem *nb = (GradClipItem *)realloc(g_clip_items, (size_t)nc * sizeof(GradClipItem));
+        if (!nb) return;
+        g_clip_items = nb;
+        g_clip_cap = nc;
+    }
+    GradClipItem *it = &g_clip_items[g_clip_count++];
+    it->g = g; it->go = go; it->n = n;
+}
+
+void gs_cu_gradclip_batch_run(int32_t d, float max_norm) {
+    int32_t count = g_clip_count;
+    g_clip_count = 0;
+    if (count <= 0) return;
+    ensure_scratch(d);
+    int64_t max_n = 0;
+    for (int32_t i = 0; i < count; i++) {
+        if (g_clip_items[i].n > max_n) max_n = g_clip_items[i].n;
+    }
+    if (max_n <= 0) return;
+    size_t chunk = (size_t)count * sizeof(void *);
+    size_t need = 3 * chunk;
+    void *host_pack = malloc(need);
+    if (!host_pack) return;
+    if (need > g_clip_meta_cap) {
+        if (g_clip_meta_buf) cudaFree(g_clip_meta_buf);
+        if (cudaMalloc(&g_clip_meta_buf, need) != cudaSuccess) {
+            g_clip_meta_buf = NULL;
+            g_clip_meta_cap = 0;
+            free(host_pack);
+            return;
+        }
+        g_clip_meta_cap = need;
+    }
+    char *hb = (char *)host_pack;
+    const float **hgs = (const float **)(hb + 0 * chunk);
+    float **hgos = (float **)(hb + 1 * chunk);
+    int64_t *hnum = (int64_t *)(hb + 2 * chunk);
+    for (int32_t i = 0; i < count; i++) {
+        hgs[i] = g_clip_items[i].g;
+        hgos[i] = g_clip_items[i].go;
+        hnum[i] = g_clip_items[i].n;
+    }
+    cudaMemcpy(g_clip_meta_buf, host_pack, need, cudaMemcpyHostToDevice);
+    free(host_pack);
+    char *db = (char *)g_clip_meta_buf;
+    const float **d_gs = (const float **)(db + 0 * chunk);
+    float **d_gos = (float **)(db + 1 * chunk);
+    int64_t *d_num = (int64_t *)(db + 2 * chunk);
+    cudaMemsetAsync(g_reduce_buf, 0, sizeof(float), 0);
+    int bx = grid1d((max_n >> 2) + 1);
+    if (bx > 1024) bx = 1024;
+    int32_t off = 0;
+    while (off < count) {
+        int32_t batch = count - off;
+        if (batch > 65535) batch = 65535;
+        dim3 grid((unsigned int)bx, (unsigned int)batch);
+        k_sum_sq_multi<<<grid, 256>>>(batch, d_gs + off, d_num + off, g_reduce_buf);
+        off += batch;
+    }
+    off = 0;
+    while (off < count) {
+        int32_t batch = count - off;
+        if (batch > 65535) batch = 65535;
+        dim3 grid((unsigned int)bx, (unsigned int)batch);
+        k_clip_scale_multi<<<grid, 256>>>(batch, d_gs + off, d_gos + off, d_num + off, g_reduce_buf, max_norm);
+        off += batch;
+    }
 }
 
 } // extern "C"
