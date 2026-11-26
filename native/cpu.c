@@ -1,4 +1,4 @@
-#include "gs_tensor_backend.h"
+#include "backend.h"
 
 #include <math.h>
 #include <stdlib.h>

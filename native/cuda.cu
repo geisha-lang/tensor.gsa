@@ -2,7 +2,7 @@
 
 #ifdef GS_TENSOR_CUDA
 
-#include "gs_tensor_backend.h"
+#include "backend.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <math.h>

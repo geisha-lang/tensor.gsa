@@ -6,7 +6,7 @@ Functional, zero-boilerplate Deep Learning framework for **Geisha**.
 - **Local-Tape Reverse-Mode AD**: `valueAndGrad(model, lossFn)` with `customVjp` hook for fused kernels.
 - **Multi-Backend Native Kernels (`GsTensorBackend`)**:
   - **CPU**: portable cache-tiled C11 (`-DGS_TENSOR_NO_ACCELERATE`), Linux OpenBLAS (`-DGS_TENSOR_OPENBLAS`), or macOS Apple Accelerate (`cblas_sgemm` + `vDSP`).
-  - **CUDA**: `native/gs_backend_cuda.cu` (`cublasSgemm` / `cublasSgemmStridedBatched` + CUDA kernels, enable with `-DGS_TENSOR_CUDA -lcudart -lcublas`).
+  - **CUDA**: `native/cuda.cu` (`cublasSgemm` / `cublasSgemmStridedBatched` + CUDA kernels, auto-detected when `nvcc` is on `PATH`).
 - **Optimizers**: Pure functional `AdamW` and `Muon` (5-step Newton-Schulz orthogonalization for 2D matrices).
 - **HuggingFace Interoperability**: Pure-Geisha `safetensors` reader/writer + `StateDict` auto-deriving (`Named` field paths match `LlamaForCausalLM` 1-to-1) + `config.json` exporter.
 
@@ -42,4 +42,4 @@ let _ = saveSafetensors("model.safetensors", lm1);
 
 - **macOS**: automatically enables Apple Accelerate (`cblas_sgemm` + `vDSP`).
 - **Linux (CPU)**: automatically detects `openblas` via `pkg-config`, falling back to portable cache-tiled C11.
-- **Linux (NVIDIA GPU)**: automatically detects `nvcc` on `PATH`, compiles `native/gs_backend_cuda.cu`, and links `cudart` + `cublas` (disable with `GEISHA_DISABLE_TOOL=nvcc`).
+- **Linux (NVIDIA GPU)**: automatically detects `nvcc` on `PATH`, compiles `native/cuda.cu`, and links `cudart` + `cublas` (disable with `GEISHA_DISABLE_TOOL=nvcc`).
