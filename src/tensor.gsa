@@ -6,6 +6,7 @@ use std.list.{listLen, listNth, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
 use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaAvailable, autoDevice}
 use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
+use tensor.metal.{metalAllocShared, metalSync, metalScaleOrAxpy}
 
 // ============================================================================
 // Tensor & IntTensor Types
@@ -13,6 +14,7 @@ use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
 
 pub data Tensor {
     buf: ForeignPtr,
+    gpuBuf: Option ForeignPtr,
     shape: List Int,
     numel: Int,
     device: Device,
@@ -134,10 +136,26 @@ pub def packI32List(xs: List Int): ForeignPtr = {
 pub def allocBuf(_dev: Device, nbytes: Int64): ForeignPtr =
     foreignPtrAlloc(if (nbytes > intToI64(0)) nbytes else intToI64(4))
 
+pub def isMetal(d: Device): Bool = match d {
+    Metal(_) -> true,
+    _ -> false,
+}
+
+pub def syncDevice(d: Device): Void = match d {
+    Metal(_) -> metalSync(),
+    _ -> (),
+}
+
 pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
     let n = shapeProd(sh);
     let nb = intToI64(n) * intToI64(4);
-    Tensor { buf: allocBuf(dev, nb), shape: sh, numel: n, device: dev, nodeId: -1 }
+    match dev {
+        Metal(_) -> {
+            let (cpuView, gpuOwner) = metalAllocShared(nb);
+            Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1 }
+        },
+        _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1 },
+    }
 }
 
 pub def zerosOn(sh: List Int, dev: Device): Tensor = allocTensorOn(sh, dev)
@@ -222,20 +240,24 @@ pub def tensorDevice(t: Tensor): Device = t.device
 pub def toDevice(t: Tensor, dev: Device): Tensor =
     if (t.device == dev) t
     else {
+        syncDevice(t.device);
         let out = allocTensorOn(t.shape, dev);
         cpuCopy(out.buf, t.buf, t.numel);
         out
     }
 
 pub def detach(t: Tensor): Tensor =
-    Tensor { buf: t.buf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1 }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1 }
 
-pub def getAt(t: Tensor, idx: Int): Float =
+pub def getAt(t: Tensor, idx: Int): Float = {
+    syncDevice(t.device);
     withForeignPtr(t.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
+}
 
 pub def item(t: Tensor): Float = getAt(t, 0)
 
-pub def toList(t: Tensor): List Float =
+pub def toList(t: Tensor): List Float = {
+    syncDevice(t.device);
     withForeignPtr(t.buf, (sp) -> {
         let acc = cellNew(Nil);
         let i = cellNew(t.numel - 1);
@@ -246,11 +268,17 @@ pub def toList(t: Tensor): List Float =
         };
         cellGet(acc)
     })
+}
 
 pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void =
-    cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel)
+    if (isMetal(y.device)) {
+        metalScaleOrAxpy("k_axpy", x.gpuBuf, y.gpuBuf, floatToF32(alpha), y.numel)
+    } else {
+        cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel)
+    }
 
 pub def cloneTensor(t: Tensor): Tensor = {
+    syncDevice(t.device);
     let out = allocTensorOn(t.shape, t.device);
     cpuCopy(out.buf, t.buf, t.numel);
     out
@@ -298,7 +326,7 @@ pub def endTape(): Void = cellSet(activeTapeCell, None)
 pub def stampLeaf(tp: Tape, t: Tensor): Tensor = {
     let id = vecLen(tp.nodes);
     vecPush(tp.nodes, TapeNode { bwd: (_) -> Nil });
-    Tensor { buf: t.buf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id }
 }
 
 def anyTracked(ids: List Int): Bool = match ids {
@@ -313,7 +341,7 @@ pub def customVjp(inputIds: List Int, out: Tensor, bwdFn: Tensor -> List (Int, T
         Some(tp) -> {
             let id = vecLen(tp.nodes);
             vecPush(tp.nodes, TapeNode { bwd: bwdFn });
-            Tensor { buf: out.buf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id }
+            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id }
         },
     }
 

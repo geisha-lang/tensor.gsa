@@ -1,0 +1,455 @@
+// Pure-Geisha Apple Metal + MetalPerformanceShaders (MPS) GPU backend (`tensor.metal`).
+// ZERO lines of C or Objective-C! Calls `MTLCreateSystemDefaultDevice`, `MPSMatrixMultiplication`,
+// and runtime-compiled MSL compute shaders directly via ARM64 `objc_msgSend`.
+//
+// Features:
+// - Unified Memory (`MTLResourceStorageModeShared = 0`): zero-copy CPU/GPU shared `MTLBuffer`
+// - GC-managed GPU buffers (`foreignPtrNew(mtlBuf, dlsym("objc_release"), nbytes)`)
+// - Deferred `MTLCommandBuffer` batching (multiple GPU ops encoded per commit, synced on demand)
+// - `MPSMatrixMultiplication` for high-throughput GPU GEMM & Batched GEMM
+// - Runtime-compiled MSL compute shaders for elementwise ops & fused AdamW
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecPush, vecClear, vecLen, vecGet}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
+
+// ============================================================================
+// Direct Objective-C Runtime & Metal C ABI Bindings
+// ============================================================================
+
+extern "MTLCreateSystemDefaultDevice" def c_mtl_default_device(): Ptr
+extern "objc_getClass" def c_objc_class(name: String): Ptr
+extern "sel_registerName" def c_sel(name: String): Ptr
+extern "objc_autoreleasePoolPush" def c_pool_push(): Ptr
+extern "objc_autoreleasePoolPop" def c_pool_pop(pool: Ptr): Void
+extern "dlsym" def c_dlsym(handle: Ptr, sym: String): Ptr
+
+// Typed ARM64 `objc_msgSend` signatures (no varargs, exact AAPCS64 register ABI)
+extern "objc_msgSend" def msg0(obj: Ptr, sel: Ptr): Ptr
+extern "objc_msgSend" def msg0_v(obj: Ptr, sel: Ptr): Void
+extern "objc_msgSend" def msg1_p(obj: Ptr, sel: Ptr, a: Ptr): Ptr
+extern "objc_msgSend" def msg1_v_p(obj: Ptr, sel: Ptr, a: Ptr): Void
+extern "objc_msgSend" def msg1_str(obj: Ptr, sel: Ptr, s: String): Ptr
+extern "objc_msgSend" def msg2_i64(obj: Ptr, sel: Ptr, a: Int64, b: Int64): Ptr
+extern "objc_msgSend" def msg2_pp(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr): Ptr
+extern "objc_msgSend" def msg3_ppp(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr, c: Ptr): Ptr
+extern "objc_msgSend" def msg3_v_pi64i64(obj: Ptr, sel: Ptr, a: Ptr, b: Int64, c: Int64): Void
+extern "objc_msgSend" def msg3_v_spi64i64(obj: Ptr, sel: Ptr, a: ScopedPtr, b: Int64, c: Int64): Void
+extern "objc_msgSend" def msg4_v_pppp(obj: Ptr, sel: Ptr, a: Ptr, b: Ptr, c: Ptr, d: Ptr): Void
+extern "objc_msgSend" def msg4_desc(obj: Ptr, sel: Ptr, rows: Int64, cols: Int64, rowBytes: Int64, dtype: Int): Ptr
+extern "objc_msgSend" def msg6_bdesc(obj: Ptr, sel: Ptr, rows: Int64, cols: Int64, matrices: Int64, rowBytes: Int64, matBytes: Int64, dtype: Int): Ptr
+extern "objc_msgSend" def msg2_v_spsp(obj: Ptr, sel: Ptr, a: ScopedPtr, b: ScopedPtr): Void
+extern "objc_msgSend" def msg8_mps_mm(
+    obj: Ptr, sel: Ptr,
+    dev: Ptr, transL: Int, transR: Int,
+    resRows: Int64, resCols: Int64, innerCols: Int64,
+    alpha: Float, beta: Float
+): Ptr
+
+// ============================================================================
+// Runtime MSL Compute Shader Library
+// ============================================================================
+
+def mslSource(): String =
+    "#include <metal_stdlib>\n"
+    + "using namespace metal;\n"
+    + "kernel void k_add(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* o [[buffer(2)]], uint i [[thread_position_in_grid]]) { o[i] = a[i] + b[i]; }\n"
+    + "kernel void k_sub(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* o [[buffer(2)]], uint i [[thread_position_in_grid]]) { o[i] = a[i] - b[i]; }\n"
+    + "kernel void k_mul(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* o [[buffer(2)]], uint i [[thread_position_in_grid]]) { o[i] = a[i] * b[i]; }\n"
+    + "kernel void k_div(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* o [[buffer(2)]], uint i [[thread_position_in_grid]]) { o[i] = a[i] / b[i]; }\n"
+    + "kernel void k_scale(device const float* a [[buffer(0)]], device float* o [[buffer(1)]], constant float& s [[buffer(2)]], uint i [[thread_position_in_grid]]) { o[i] = a[i] * s; }\n"
+    + "kernel void k_axpy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant float& alpha [[buffer(2)]], uint i [[thread_position_in_grid]]) { y[i] += alpha * x[i]; }\n"
+    + "kernel void k_silu_fwd(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], uint i [[thread_position_in_grid]]) { float v = x[i]; o[i] = v / (1.0f + exp(-v)); }\n"
+    + "kernel void k_silu_bwd(device const float* x [[buffer(0)]], device const float* gy [[buffer(1)]], device float* gx [[buffer(2)]], uint i [[thread_position_in_grid]]) { float v = x[i]; float s = 1.0f / (1.0f + exp(-v)); gx[i] = gy[i] * s * (1.0f + v * (1.0f - s)); }\n"
+    + "kernel void k_relu_fwd(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], uint i [[thread_position_in_grid]]) { float v = x[i]; o[i] = v > 0.0f ? v : 0.0f; }\n"
+    + "kernel void k_relu_bwd(device const float* x [[buffer(0)]], device const float* gy [[buffer(1)]], device float* gx [[buffer(2)]], uint i [[thread_position_in_grid]]) { gx[i] = x[i] > 0.0f ? gy[i] : 0.0f; }\n"
+    + "kernel void k_sigmoid_fwd(device const float* x [[buffer(0)]], device float* o [[buffer(1)]], uint i [[thread_position_in_grid]]) { o[i] = 1.0f / (1.0f + exp(-x[i])); }\n"
+    + "kernel void k_sigmoid_bwd(device const float* y [[buffer(0)]], device const float* gy [[buffer(1)]], device float* gx [[buffer(2)]], uint i [[thread_position_in_grid]]) { float yv = y[i]; gx[i] = gy[i] * yv * (1.0f - yv); }\n"
+    + "struct AdamwArgs { float lr; float b1; float b2; float eps; float wd; float bc1; float bc2; };\n"
+    + "kernel void k_adamw(device const float* p [[buffer(0)]], device const float* g [[buffer(1)]], device const float* m [[buffer(2)]], device const float* v [[buffer(3)]], device float* po [[buffer(4)]], device float* mo [[buffer(5)]], device float* vo [[buffer(6)]], constant AdamwArgs& a [[buffer(7)]], uint i [[thread_position_in_grid]]) {\n"
+    + "  float gi = g[i];\n"
+    + "  float mi = a.b1 * m[i] + (1.0f - a.b1) * gi;\n"
+    + "  float vi = a.b2 * v[i] + (1.0f - a.b2) * gi * gi;\n"
+    + "  mo[i] = mi; vo[i] = vi;\n"
+    + "  po[i] = p[i] * (1.0f - a.lr * a.wd) - a.lr * ((mi / a.bc1) / (sqrt(vi / a.bc2) + a.eps));\n"
+    + "}\n"
+
+// ============================================================================
+// Lazy Singleton Metal Context & Deferred CommandBuffer
+// ============================================================================
+
+data MetalCtx {
+    device: Ptr,
+    queue: Ptr,
+    library: Ptr,
+    objcReleaseFn: Ptr,
+    pipelines: StrMap Ptr,
+    pendingCmd: Cell (Option Ptr),
+    keepAlive: Vec ForeignPtr,
+    tempRelease: Vec Ptr,
+}
+
+def gMetalCtx: Cell (Option MetalCtx) = cellNew(None)
+def gMetalProbed: Cell Bool = cellNew(false)
+
+def nsString(s: String): Ptr =
+    msg1_str(c_objc_class("NSString"), c_sel("stringWithUTF8String:"), s)
+
+def getMetalCtx(): Option MetalCtx =
+    if (cellGet(gMetalProbed)) cellGet(gMetalCtx)
+    else {
+        cellSet(gMetalProbed, true);
+        let pool = c_pool_push();
+        let dev = c_mtl_default_device();
+        if (ptrIsNull(dev)) {
+            c_pool_pop(pool);
+            None
+        } else {
+            let queue = msg0(dev, c_sel("newCommandQueue"));
+            let srcNs = nsString(mslSource());
+            let lib = msg3_ppp(dev, c_sel("newLibraryWithSource:options:error:"), srcNs, ptrNull(), ptrNull());
+            // macOS RTLD_DEFAULT = (void*)-2
+            let rtldDefault = ptrOffset(ptrNull(), -2);
+            let relFn = c_dlsym(rtldDefault, "objc_release");
+            let ctx = MetalCtx {
+                device: dev,
+                queue: queue,
+                library: lib,
+                objcReleaseFn: relFn,
+                pipelines: strMapNew(),
+                pendingCmd: cellNew(None),
+                keepAlive: vecNew(),
+                tempRelease: vecNew(),
+            };
+            cellSet(gMetalCtx, Some(ctx));
+            c_pool_pop(pool);
+            Some(ctx)
+        }
+    }
+
+pub def metalAvailable(): Bool = match getMetalCtx() {
+    Some(_) -> true,
+    None -> false,
+}
+
+def getPipeline(ctx: MetalCtx, name: String): Ptr =
+    match strMapGet(ctx.pipelines, name) {
+        Some(p) -> p,
+        None -> {
+            let pool = c_pool_push();
+            let fnObj = msg1_p(ctx.library, c_sel("newFunctionWithName:"), nsString(name));
+            let pso = msg2_pp(ctx.device, c_sel("newComputePipelineStateWithFunction:error:"), fnObj, ptrNull());
+            msg0_v(fnObj, c_sel("release"));
+            strMapInsert(ctx.pipelines, name, pso);
+            c_pool_pop(pool);
+            pso
+        },
+    }
+
+def ensureCmdBuf(ctx: MetalCtx): Ptr = match cellGet(ctx.pendingCmd) {
+    Some(cb) -> cb,
+    None -> {
+        let cb = msg0(ctx.queue, c_sel("commandBuffer"));
+        let _ = msg0(cb, c_sel("retain"));
+        cellSet(ctx.pendingCmd, Some(cb));
+        cb
+    },
+}
+
+// Commit and wait for all pending Metal GPU operations (called automatically before CPU reads).
+pub def metalSync(): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> match cellGet(ctx.pendingCmd) {
+        None -> (),
+        Some(cb) -> {
+            let pool = c_pool_push();
+            msg0_v(cb, c_sel("commit"));
+            msg0_v(cb, c_sel("waitUntilCompleted"));
+            msg0_v(cb, c_sel("release"));
+            cellSet(ctx.pendingCmd, None);
+            // Release temporary MPS wrapper objects now that GPU finished
+            let i = cellNew(0);
+            let n = vecLen(ctx.tempRelease);
+            while (cellGet(i) < n) {
+                match vecGet(ctx.tempRelease, cellGet(i)) {
+                    Some(obj) -> msg0_v(obj, c_sel("release")),
+                    None -> (),
+                };
+                cellSet(i, cellGet(i) + 1)
+            };
+            vecClear(ctx.tempRelease);
+            vecClear(ctx.keepAlive);
+            c_pool_pop(pool)
+        },
+    },
+}
+
+// Allocate Unified Memory `MTLBuffer` (`MTLResourceStorageModeShared = 0`):
+// Returns `(cpuViewForeignPtr, gpuOwnerForeignPtr)` sharing the exact same physical RAM!
+pub def metalAllocShared(nbytes: Int64): (ForeignPtr, Option ForeignPtr) = match getMetalCtx() {
+    None -> (foreignPtrAlloc(if (nbytes > intToI64(0)) nbytes else intToI64(4)), None),
+    Some(ctx) -> {
+        let sz = if (nbytes > intToI64(0)) nbytes else intToI64(64);
+        let mtlBuf = msg2_i64(ctx.device, c_sel("newBufferWithLength:options:"), sz, intToI64(0));
+        let contentsPtr = msg0(mtlBuf, c_sel("contents"));
+        let gpuOwner = foreignPtrNew(mtlBuf, ctx.objcReleaseFn, sz);
+        let cpuView = foreignPtrNew(contentsPtr, ptrNull(), intToI64(0));
+        (cpuView, Some(gpuOwner))
+    },
+}
+
+extern noalloc "gc_foreign_ptr_get" def c_fp_raw(fp: ForeignPtr): Ptr
+
+def unwrapGpuBuf(ctx: MetalCtx, gpuOpt: Option ForeignPtr): Ptr = match gpuOpt {
+    Some(fp) -> {
+        vecPush(ctx.keepAlive, fp);
+        c_fp_raw(fp)
+    },
+    None -> ptrNull(),
+}
+
+// ============================================================================
+// MPSMatrixMultiplication (GPU GEMM & Batched GEMM)
+// ============================================================================
+
+pub def metalSgemm(
+    transA: Bool, transB: Bool,
+    m: Int, n: Int, k: Int,
+    alpha: Float, aGpu: Option ForeignPtr, bGpu: Option ForeignPtr,
+    beta: Float, cGpu: Option ForeignPtr
+): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> {
+        let pool = c_pool_push();
+        let cb = ensureCmdBuf(ctx);
+        let bufA = unwrapGpuBuf(ctx, aGpu);
+        let bufB = unwrapGpuBuf(ctx, bGpu);
+        let bufC = unwrapGpuBuf(ctx, cGpu);
+
+        let aRows = intToI64(if (transA) k else m);
+        let aCols = intToI64(if (transA) m else k);
+        let bRows = intToI64(if (transB) n else k);
+        let bCols = intToI64(if (transB) k else n);
+        let m64 = intToI64(m);
+        let n64 = intToI64(n);
+        let k64 = intToI64(k);
+        let f32Type = 268435488; // MPSDataTypeFloat32
+
+        let descCls = c_objc_class("MPSMatrixDescriptor");
+        let selDesc = c_sel("matrixDescriptorWithRows:columns:rowBytes:dataType:");
+        let dA = msg4_desc(descCls, selDesc, aRows, aCols, aCols * intToI64(4), f32Type);
+        let dB = msg4_desc(descCls, selDesc, bRows, bCols, bCols * intToI64(4), f32Type);
+        let dC = msg4_desc(descCls, selDesc, m64, n64, n64 * intToI64(4), f32Type);
+
+        let matCls = c_objc_class("MPSMatrix");
+        let selAlloc = c_sel("alloc");
+        let selInitMat = c_sel("initWithBuffer:descriptor:");
+        let mA = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufA, dA);
+        let mB = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufB, dB);
+        let mC = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufC, dC);
+
+        let mmCls = c_objc_class("MPSMatrixMultiplication");
+        let mm = msg8_mps_mm(
+            msg0(mmCls, selAlloc),
+            c_sel("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:"),
+            ctx.device, if (transA) 1 else 0, if (transB) 1 else 0,
+            m64, n64, k64, alpha, beta
+        );
+        msg4_v_pppp(mm, c_sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cb, mA, mB, mC);
+
+        vecPush(ctx.tempRelease, mm);
+        vecPush(ctx.tempRelease, mA);
+        vecPush(ctx.tempRelease, mB);
+        vecPush(ctx.tempRelease, mC);
+        c_pool_pop(pool)
+    },
+}
+
+pub def metalBgemm(
+    batch: Int, transA: Bool, transB: Bool,
+    m: Int, n: Int, k: Int,
+    alpha: Float, aGpu: Option ForeignPtr, bGpu: Option ForeignPtr,
+    beta: Float, cGpu: Option ForeignPtr
+): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> {
+        let pool = c_pool_push();
+        let cb = ensureCmdBuf(ctx);
+        let bufA = unwrapGpuBuf(ctx, aGpu);
+        let bufB = unwrapGpuBuf(ctx, bGpu);
+        let bufC = unwrapGpuBuf(ctx, cGpu);
+
+        let b64 = intToI64(batch);
+        let aRows = intToI64(if (transA) k else m);
+        let aCols = intToI64(if (transA) m else k);
+        let bRows = intToI64(if (transB) n else k);
+        let bCols = intToI64(if (transB) k else n);
+        let m64 = intToI64(m);
+        let n64 = intToI64(n);
+        let k64 = intToI64(k);
+        let f32Type = 268435488;
+
+        let descCls = c_objc_class("MPSMatrixDescriptor");
+        let selBDesc = c_sel("matrixDescriptorWithRows:columns:matrices:rowBytes:matrixBytes:dataType:");
+        let dA = msg6_bdesc(descCls, selBDesc, aRows, aCols, b64, aCols * intToI64(4), aRows * aCols * intToI64(4), f32Type);
+        let dB = msg6_bdesc(descCls, selBDesc, bRows, bCols, b64, bCols * intToI64(4), bRows * bCols * intToI64(4), f32Type);
+        let dC = msg6_bdesc(descCls, selBDesc, m64, n64, b64, n64 * intToI64(4), m64 * n64 * intToI64(4), f32Type);
+
+        let matCls = c_objc_class("MPSMatrix");
+        let selAlloc = c_sel("alloc");
+        let selInitMat = c_sel("initWithBuffer:descriptor:");
+        let mA = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufA, dA);
+        let mB = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufB, dB);
+        let mC = msg2_pp(msg0(matCls, selAlloc), selInitMat, bufC, dC);
+
+        let mmCls = c_objc_class("MPSMatrixMultiplication");
+        let mm = msg8_mps_mm(
+            msg0(mmCls, selAlloc),
+            c_sel("initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:"),
+            ctx.device, if (transA) 1 else 0, if (transB) 1 else 0,
+            m64, n64, k64, alpha, beta
+        );
+        msg4_v_pppp(mm, c_sel("encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:"), cb, mA, mB, mC);
+
+        vecPush(ctx.tempRelease, mm);
+        vecPush(ctx.tempRelease, mA);
+        vecPush(ctx.tempRelease, mB);
+        vecPush(ctx.tempRelease, mC);
+        c_pool_pop(pool)
+    },
+}
+
+// ============================================================================
+// MSL Compute Shader Dispatch Helpers
+// ============================================================================
+
+// ARM64 AAPCS64 passes >16B structs (`MTLSize` = 24B) indirectly by pointer!
+def dispatch1d(enc: Ptr, n: Int): Void = {
+    let tg = if (n < 256) (if (n > 0) n else 1) else 256;
+    withAlloca(24, (gridSz) ->
+        withAlloca(24, (tgSz) -> {
+            scopedPtrWriteI64Le(gridSz, intToI64(0), intToI64(n));
+            scopedPtrWriteI64Le(gridSz, intToI64(8), intToI64(1));
+            scopedPtrWriteI64Le(gridSz, intToI64(16), intToI64(1));
+            scopedPtrWriteI64Le(tgSz, intToI64(0), intToI64(tg));
+            scopedPtrWriteI64Le(tgSz, intToI64(8), intToI64(1));
+            scopedPtrWriteI64Le(tgSz, intToI64(16), intToI64(1));
+            msg2_v_spsp(enc, c_sel("dispatchThreads:threadsPerThreadgroup:"), gridSz, tgSz)
+        })
+    )
+}
+
+pub def metalBinopSame(op: Int, aGpu: Option ForeignPtr, bGpu: Option ForeignPtr, outGpu: Option ForeignPtr, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let kname = if (op == 0) "k_add" else if (op == 1) "k_sub" else if (op == 2) "k_mul" else "k_div";
+            let pso = getPipeline(ctx, kname);
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, aGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, bGpu), intToI64(0), intToI64(1));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(2));
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalScaleOrAxpy(kname: String, aGpu: Option ForeignPtr, outGpu: Option ForeignPtr, s: Float32, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, kname);
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, aGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            withAlloca(4, (sp) -> {
+                scopedPtrWriteF32Le(sp, 0, s);
+                msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(4), intToI64(2))
+            });
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalUnary2(kname: String, xGpu: Option ForeignPtr, outGpu: Option ForeignPtr, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, kname);
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, xGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(1));
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalUnary3(kname: String, aGpu: Option ForeignPtr, bGpu: Option ForeignPtr, outGpu: Option ForeignPtr, n: Int): Void =
+    match getMetalCtx() {
+        None -> (),
+        Some(ctx) -> {
+            let pool = c_pool_push();
+            let pso = getPipeline(ctx, kname);
+            let cb = ensureCmdBuf(ctx);
+            let enc = msg0(cb, c_sel("computeCommandEncoder"));
+            msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+            let selBuf = c_sel("setBuffer:offset:atIndex:");
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, aGpu), intToI64(0), intToI64(0));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, bGpu), intToI64(0), intToI64(1));
+            msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, outGpu), intToI64(0), intToI64(2));
+            dispatch1d(enc, n);
+            msg0_v(enc, c_sel("endEncoding"));
+            c_pool_pop(pool)
+        },
+    }
+
+pub def metalAdamwStep(
+    pGpu: Option ForeignPtr, gGpu: Option ForeignPtr, mGpu: Option ForeignPtr, vGpu: Option ForeignPtr,
+    poGpu: Option ForeignPtr, moGpu: Option ForeignPtr, voGpu: Option ForeignPtr,
+    n: Int, lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
+): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> {
+        let pool = c_pool_push();
+        let pso = getPipeline(ctx, "k_adamw");
+        let cb = ensureCmdBuf(ctx);
+        let enc = msg0(cb, c_sel("computeCommandEncoder"));
+        msg1_v_p(enc, c_sel("setComputePipelineState:"), pso);
+        let selBuf = c_sel("setBuffer:offset:atIndex:");
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, pGpu), intToI64(0), intToI64(0));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, gGpu), intToI64(0), intToI64(1));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, mGpu), intToI64(0), intToI64(2));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, vGpu), intToI64(0), intToI64(3));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, poGpu), intToI64(0), intToI64(4));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, moGpu), intToI64(0), intToI64(5));
+        msg3_v_pi64i64(enc, selBuf, unwrapGpuBuf(ctx, voGpu), intToI64(0), intToI64(6));
+        withAlloca(28, (sp) -> {
+            scopedPtrWriteF32Le(sp, 0, lr);
+            scopedPtrWriteF32Le(sp, 4, b1);
+            scopedPtrWriteF32Le(sp, 8, b2);
+            scopedPtrWriteF32Le(sp, 12, eps);
+            scopedPtrWriteF32Le(sp, 16, wd);
+            scopedPtrWriteF32Le(sp, 20, bc1);
+            scopedPtrWriteF32Le(sp, 24, bc2);
+            msg3_v_spi64i64(enc, c_sel("setBytes:length:atIndex:"), sp, intToI64(28), intToI64(7))
+        });
+        dispatch1d(enc, n);
+        msg0_v(enc, c_sel("endEncoding"));
+        c_pool_pop(pool)
+    },
+}

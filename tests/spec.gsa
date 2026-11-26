@@ -11,12 +11,13 @@ use sys.fs.removeFile
 use sys.io.eprintLn
 use sys.proc.exit
 
-use tensor.backend.Cpu
-use tensor.tensor.{Tensor, fromList, fromI32List, getAt, item, shapeEq}
+use tensor.backend.{Cpu, Metal}
+use tensor.metal.metalAvailable
+use tensor.tensor.{Tensor, fromList, fromI32List, fromI32ListOn, randnOn, toDevice, getAt, item, shapeEq}
 use tensor.ops.{
     add, sub, mul, divT, silu, sigmoid, exp, log, square, clamp,
     rmsNorm, layerNorm, l2NormLast, logSumExpLast,
-    crossEntropy, crossEntropyIgnore, mseLoss, matmulNT,
+    crossEntropy, crossEntropyIgnore, mseLoss, matmul, matmulNT,
     sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
 }
 use tensor.ad.{Params, valueAndGrad, paramCount}
@@ -236,6 +237,49 @@ def testSafetensorsRoundtrip(trained: CausalLM): Result Void String = {
     Ok(())
 }
 
+// 6. Pure-Geisha Apple Metal + MPS GPU parity & training test
+def testMetalGpu(): Result Void String =
+    if (!metalAvailable()) Ok(())
+    else {
+        // MPSMatrixMultiplication + MSL compute parity vs Cpu
+        let aCpu = randnOn([64, 128], intToI64(11), 0.2, Cpu);
+        let bCpu = randnOn([128, 64], intToI64(22), 0.2, Cpu);
+        let cCpu = silu(matmul(aCpu, bCpu));
+
+        let aGpu = toDevice(aCpu, Metal(0));
+        let bGpu = toDevice(bCpu, Metal(0));
+        let cGpu = silu(matmul(aGpu, bGpu));
+        let diff = l2NormFloat(toDevice(cGpu, Cpu) - cCpu);
+        let _ = assertTrue("metal_mps_gemm_silu_parity", diff < 1.0e-3)?;
+
+        // Full CausalLM training on Metal(0) with deferred command buffer + Metal AdamW
+        let cfgM = LMConfig {
+            vocabSize: 16, hiddenSize: 32, intermediateSize: 64,
+            numLayers: 2, numHeads: 4, rmsNormEps: 1.0e-5, ropeTheta: 10000.0,
+            device: Metal(0),
+        };
+        let (lm0, _) = initCausalLM(cfgM, rngNew(42));
+        let inp = fromI32ListOn([1, 6], [1, 2, 3, 4, 5, 6], Metal(0));
+        let tgt = fromI32ListOn([1, 6], [2, 3, 4, 5, 6, 7], Metal(0));
+        let optCfg = defaultAdamW(0.02);
+        let lmCell = cellNew(lm0);
+        let stCell = cellNew(adamwInit(lm0));
+        let firstLoss = cellNew(0.0);
+        let lastLoss = cellNew(0.0);
+        let step = cellNew(0);
+        while (cellGet(step) < 15) {
+            let (loss, grads) = valueAndGrad(cellGet(lmCell), (m) -> crossEntropy(causalLMFwd(m, inp), tgt));
+            if (cellGet(step) == 0) cellSet(firstLoss, loss) else ();
+            cellSet(lastLoss, loss);
+            let (lmNext, stNext) = adamwStep(optCfg, cellGet(stCell), cellGet(lmCell), clipGradNorm(grads, 1.0));
+            cellSet(lmCell, lmNext);
+            cellSet(stCell, stNext);
+            cellSet(step, cellGet(step) + 1)
+        };
+        let _ = assertTrue("metal_lm_loss_dropped", cellGet(lastLoss) < cellGet(firstLoss) * 0.35)?;
+        Ok(())
+    }
+
 def runAll(): Result Void String = {
     let _ = testBroadcasting()?;
     let _ = testUniversalOps()?;
@@ -243,11 +287,12 @@ def runAll(): Result Void String = {
     let trained = testTrainAdamW()?;
     let _ = testTrainMuon()?;
     let _ = testSafetensorsRoundtrip(trained)?;
+    let _ = testMetalGpu()?;
     Ok(())
 }
 
 def main(): Void = match runAll() {
-    Ok(_) -> printLn("PASS [tensor.gsa]: broadcast + universal ops + gradcheck + AdamW + Muon + HF safetensors"),
+    Ok(_) -> printLn("PASS [tensor.gsa]: broadcast + universal ops + gradcheck + AdamW + Muon + HF safetensors + Metal/MPS GPU"),
     Err(msg) -> {
         eprintLn(msg);
         exit(1)

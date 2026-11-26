@@ -4,8 +4,9 @@
 use std.option.{Some, None}
 use std.list.listLen
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet}
-use tensor.tensor.{Tensor, zerosLike, allocTensorOn, dimAt, adamwStepRaw, detach}
+use tensor.tensor.{Tensor, zerosLike, allocTensorOn, dimAt, adamwStepRaw, detach, isMetal}
 use tensor.cpu.cpuAdamwStep
+use tensor.metal.metalAdamwStep
 use tensor.ops.{add, mul, scale, matmul, transpose2d, l2NormFloat}
 use tensor.ad.{Params, mapParams, zipParams, collectParams, gradNorm}
 
@@ -115,7 +116,11 @@ pub def adamwStep(cfg, st, model, grads): forall m. (Params m) => (AdamWConfig, 
                         let pOut = allocTensorOn(p.shape, p.device);
                         let mOut = allocTensorOn(m.shape, m.device);
                         let vOut = allocTensorOn(v.shape, v.device);
-                        cpuAdamwStep(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2);
+                        if (isMetal(p.device)) {
+                            metalAdamwStep(p.gpuBuf, g.gpuBuf, m.gpuBuf, v.gpuBuf, pOut.gpuBuf, mOut.gpuBuf, vOut.gpuBuf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
+                        } else {
+                            cpuAdamwStep(p.buf, g.buf, m.buf, v.buf, pOut.buf, mOut.buf, vOut.buf, p.numel, lr32, b132, b232, eps32, wd32, bc1, bc2)
+                        };
                         vecPush(pOutVec, pOut);
                         vecPush(mOutVec, mOut);
                         vecPush(vOutVec, vOut)

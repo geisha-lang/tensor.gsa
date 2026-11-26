@@ -7,7 +7,13 @@ tests = ["tests/spec.gsa"]
 
 [[target.native.when]]
 os = "macos"
-link_flags = ["-framework", "Accelerate"]
+link_flags = [
+    "-framework", "Accelerate",
+    "-framework", "Metal",
+    "-framework", "MetalPerformanceShaders",
+    "-framework", "Foundation",
+    "-lobjc"
+]
 
 [[target.native.when]]
 os = "linux"
