@@ -1,0 +1,160 @@
+// NVIDIA CUDA + cuBLAS backend FFI (`tensor.cuda`).
+// Calls `extern "C" gs_cu_*` symbols from `native/cuda.cu` (overriding weak stubs).
+
+extern "gs_cu_device_count" def c_cu_device_count(): Int
+extern "gs_cu_free_fn" def c_cu_free_fn(): Ptr
+extern "gs_cu_alloc" def c_cu_alloc(dev: Int, nbytes: Int64): Ptr
+extern "gs_cu_sync" def c_cu_sync(dev: Int): Void
+extern "gs_cu_h2d" def c_cu_h2d(dev: Int, dst: ScopedPtr, src: ScopedPtr, nbytes: Int64): Void
+extern "gs_cu_d2h" def c_cu_d2h(dev: Int, dst: ScopedPtr, src: ScopedPtr, nbytes: Int64): Void
+extern "gs_cu_d2d" def c_cu_d2d(dev: Int, dst: ScopedPtr, src: ScopedPtr, nbytes: Int64): Void
+
+extern "gs_cu_sgemm" def c_cu_sgemm(
+    dev: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int,
+    alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr
+): Void
+extern "gs_cu_bgemm" def c_cu_bgemm(
+    dev: Int, batch: Int, ta: Int, tb: Int, m: Int, n: Int, k: Int,
+    alpha: Float32, a: ScopedPtr, b: ScopedPtr, beta: Float32, c: ScopedPtr
+): Void
+
+extern "gs_cu_fill" def c_cu_fill(dev: Int, dst: ScopedPtr, n: Int64, v: Float32): Void
+extern "gs_cu_copy" def c_cu_copy(dev: Int, dst: ScopedPtr, src: ScopedPtr, n: Int64): Void
+extern "gs_cu_binop_same" def c_cu_binop_same(dev: Int, op: Int, a: ScopedPtr, b: ScopedPtr, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_scale" def c_cu_scale(dev: Int, a: ScopedPtr, s: Float32, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_add_s" def c_cu_add_s(dev: Int, a: ScopedPtr, s: Float32, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_pow_f" def c_cu_pow_f(dev: Int, a: ScopedPtr, p: Float32, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_pow_b" def c_cu_pow_b(dev: Int, a: ScopedPtr, gy: ScopedPtr, p: Float32, gx: ScopedPtr, n: Int64): Void
+extern "gs_cu_clamp_f" def c_cu_clamp_f(dev: Int, a: ScopedPtr, lo: Float32, hi: Float32, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_clamp_b" def c_cu_clamp_b(dev: Int, a: ScopedPtr, gy: ScopedPtr, lo: Float32, hi: Float32, gx: ScopedPtr, n: Int64): Void
+extern "gs_cu_lrelu_f" def c_cu_lrelu_f(dev: Int, a: ScopedPtr, s: Float32, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_lrelu_b" def c_cu_lrelu_b(dev: Int, a: ScopedPtr, gy: ScopedPtr, s: Float32, gx: ScopedPtr, n: Int64): Void
+extern "gs_cu_axpy" def c_cu_axpy(dev: Int, a: Float32, x: ScopedPtr, y: ScopedPtr, n: Int64): Void
+
+extern "gs_cu_bcast_binop" def c_cu_bcast_binop(
+    dev: Int, op: Int, ndim: Int, total: Int64,
+    sh: ScopedPtr, sa: ScopedPtr, sb: ScopedPtr,
+    a: ScopedPtr, b: ScopedPtr, o: ScopedPtr
+): Void
+extern "gs_cu_bcast_reduce_sum" def c_cu_bcast_reduce_sum(
+    dev: Int, ndim: Int, srcTotal: Int64, dstTotal: Int64,
+    sh: ScopedPtr, sd: ScopedPtr, src: ScopedPtr, dst: ScopedPtr
+): Void
+
+extern "gs_cu_unary_f" def c_cu_unary_f(dev: Int, op: Int, x: ScopedPtr, o: ScopedPtr, n: Int64): Void
+extern "gs_cu_unary_b" def c_cu_unary_b(dev: Int, op: Int, x: ScopedPtr, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, n: Int64): Void
+extern "gs_cu_slice_f" def c_cu_slice_f(dev: Int, x: ScopedPtr, o: ScopedPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void
+extern "gs_cu_slice_b" def c_cu_slice_b(dev: Int, gy: ScopedPtr, gx: ScopedPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void
+extern "gs_cu_sum_ax" def c_cu_sum_ax(dev: Int, x: ScopedPtr, o: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
+extern "gs_cu_max_ax" def c_cu_max_ax(dev: Int, x: ScopedPtr, o: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
+extern "gs_cu_sum_all" def c_cu_sum_all(dev: Int, x: ScopedPtr, n: Int64): Float
+extern "gs_cu_sum_sq" def c_cu_sum_sq(dev: Int, x: ScopedPtr, n: Int64): Float
+
+extern "gs_cu_rms_f" def c_cu_rms_f(dev: Int, x: ScopedPtr, w: ScopedPtr, o: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_rms_b" def c_cu_rms_b(dev: Int, x: ScopedPtr, w: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, gw: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_ln_f" def c_cu_ln_f(dev: Int, x: ScopedPtr, w: ScopedPtr, b: ScopedPtr, o: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_ln_b" def c_cu_ln_b(dev: Int, x: ScopedPtr, w: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, gw: ScopedPtr, gb: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_l2_f" def c_cu_l2_f(dev: Int, x: ScopedPtr, o: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_l2_b" def c_cu_l2_b(dev: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, dim: Int, eps: Float32): Void
+extern "gs_cu_sm_f" def c_cu_sm_f(dev: Int, x: ScopedPtr, o: ScopedPtr, rows: Int, cols: Int): Void
+extern "gs_cu_sm_b" def c_cu_sm_b(dev: Int, y: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
+extern "gs_cu_lse_f" def c_cu_lse_f(dev: Int, x: ScopedPtr, o: ScopedPtr, rows: Int, cols: Int): Void
+extern "gs_cu_lse_b" def c_cu_lse_b(dev: Int, x: ScopedPtr, lse: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, rows: Int, cols: Int): Void
+extern "gs_cu_ce_f" def c_cu_ce_f(dev: Int, logits: ScopedPtr, targets: ScopedPtr, probsOut: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float
+extern "gs_cu_ce_b" def c_cu_ce_b(dev: Int, probs: ScopedPtr, targets: ScopedPtr, gLoss: Float32, gl: ScopedPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void
+extern "gs_cu_emb_f" def c_cu_emb_f(dev: Int, tab: ScopedPtr, ids: ScopedPtr, o: ScopedPtr, nIds: Int, dim: Int): Void
+extern "gs_cu_emb_b" def c_cu_emb_b(dev: Int, ids: ScopedPtr, gy: ScopedPtr, gtab: ScopedPtr, nIds: Int, vocab: Int, dim: Int): Void
+extern "gs_cu_rope_f" def c_cu_rope_f(dev: Int, x: ScopedPtr, o: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, th: Float32): Void
+extern "gs_cu_rope_b" def c_cu_rope_b(dev: Int, gy: ScopedPtr, gx: ScopedPtr, b: Int, s: Int, h: Int, hd: Int, th: Float32): Void
+extern "gs_cu_t2d" def c_cu_t2d(dev: Int, x: ScopedPtr, o: ScopedPtr, r: Int, c: Int): Void
+extern "gs_cu_t0213" def c_cu_t0213(dev: Int, x: ScopedPtr, o: ScopedPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void
+extern "gs_cu_causal" def c_cu_causal(dev: Int, s: ScopedPtr, bh: Int, seq: Int): Void
+extern "gs_cu_randn" def c_cu_randn(dev: Int, dst: ScopedPtr, n: Int64, seed: Int64, std: Float32): Void
+extern "gs_cu_adamw" def c_cu_adamw(
+    dev: Int, p: ScopedPtr, g: ScopedPtr, m: ScopedPtr, v: ScopedPtr,
+    po: ScopedPtr, mo: ScopedPtr, vo: ScopedPtr, n: Int64,
+    lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
+): Void
+
+// ============================================================================
+// Public Geisha Wrappers
+// ============================================================================
+
+pub def cudaDeviceCount(): Int = c_cu_device_count()
+
+pub def cudaAllocBuf(dev: Int, nbytes: Int64): ForeignPtr = {
+    let nb = if (nbytes > intToI64(0)) nbytes else intToI64(4);
+    let ptr = c_cu_alloc(dev, nb);
+    foreignPtrNew(ptr, c_cu_free_fn(), nb)
+}
+
+pub def cudaSync(dev: Int): Void = c_cu_sync(dev)
+
+pub def cudaH2d(dev: Int, dst: ForeignPtr, src: ForeignPtr, nbytes: Int64): Void =
+    c_cu_h2d(dev, dst, src, nbytes)
+
+pub def cudaD2h(dev: Int, dst: ForeignPtr, src: ForeignPtr, nbytes: Int64): Void =
+    c_cu_d2h(dev, dst, src, nbytes)
+
+pub def cudaD2d(dev: Int, dst: ForeignPtr, src: ForeignPtr, nbytes: Int64): Void =
+    c_cu_d2d(dev, dst, src, nbytes)
+
+pub def cudaSgemm(dev: Int, ta: Bool, tb: Bool, m: Int, n: Int, k: Int, alpha: Float32, a: ForeignPtr, b: ForeignPtr, beta: Float32, c: ForeignPtr): Void =
+    c_cu_sgemm(dev, if (ta) 1 else 0, if (tb) 1 else 0, m, n, k, alpha, a, b, beta, c)
+
+pub def cudaBgemm(dev: Int, batch: Int, ta: Bool, tb: Bool, m: Int, n: Int, k: Int, alpha: Float32, a: ForeignPtr, b: ForeignPtr, beta: Float32, c: ForeignPtr): Void =
+    c_cu_bgemm(dev, batch, if (ta) 1 else 0, if (tb) 1 else 0, m, n, k, alpha, a, b, beta, c)
+
+pub def cudaFill(dev: Int, dst: ForeignPtr, n: Int, v: Float32): Void = c_cu_fill(dev, dst, intToI64(n), v)
+pub def cudaCopy(dev: Int, dst: ForeignPtr, src: ForeignPtr, n: Int): Void = c_cu_copy(dev, dst, src, intToI64(n))
+pub def cudaBinopSame(dev: Int, op: Int, a: ForeignPtr, b: ForeignPtr, o: ForeignPtr, n: Int): Void = c_cu_binop_same(dev, op, a, b, o, intToI64(n))
+pub def cudaScale(dev: Int, a: ForeignPtr, s: Float32, o: ForeignPtr, n: Int): Void = c_cu_scale(dev, a, s, o, intToI64(n))
+pub def cudaAddScalar(dev: Int, a: ForeignPtr, s: Float32, o: ForeignPtr, n: Int): Void = c_cu_add_s(dev, a, s, o, intToI64(n))
+pub def cudaPowScalarFwd(dev: Int, a: ForeignPtr, p: Float32, o: ForeignPtr, n: Int): Void = c_cu_pow_f(dev, a, p, o, intToI64(n))
+pub def cudaPowScalarBwd(dev: Int, a: ForeignPtr, gy: ForeignPtr, p: Float32, gx: ForeignPtr, n: Int): Void = c_cu_pow_b(dev, a, gy, p, gx, intToI64(n))
+pub def cudaClampFwd(dev: Int, a: ForeignPtr, lo: Float32, hi: Float32, o: ForeignPtr, n: Int): Void = c_cu_clamp_f(dev, a, lo, hi, o, intToI64(n))
+pub def cudaClampBwd(dev: Int, a: ForeignPtr, gy: ForeignPtr, lo: Float32, hi: Float32, gx: ForeignPtr, n: Int): Void = c_cu_clamp_b(dev, a, gy, lo, hi, gx, intToI64(n))
+pub def cudaLeakyReluFwd(dev: Int, a: ForeignPtr, s: Float32, o: ForeignPtr, n: Int): Void = c_cu_lrelu_f(dev, a, s, o, intToI64(n))
+pub def cudaLeakyReluBwd(dev: Int, a: ForeignPtr, gy: ForeignPtr, s: Float32, gx: ForeignPtr, n: Int): Void = c_cu_lrelu_b(dev, a, gy, s, gx, intToI64(n))
+pub def cudaAxpy(dev: Int, a: Float32, x: ForeignPtr, y: ForeignPtr, n: Int): Void = c_cu_axpy(dev, a, x, y, intToI64(n))
+
+pub def cudaBcastBinop(dev: Int, op: Int, ndim: Int, total: Int, sh: ForeignPtr, sa: ForeignPtr, sb: ForeignPtr, a: ForeignPtr, b: ForeignPtr, o: ForeignPtr): Void =
+    c_cu_bcast_binop(dev, op, ndim, intToI64(total), sh, sa, sb, a, b, o)
+pub def cudaBcastReduceSum(dev: Int, ndim: Int, srcTotal: Int, dstTotal: Int, sh: ForeignPtr, sd: ForeignPtr, src: ForeignPtr, dst: ForeignPtr): Void =
+    c_cu_bcast_reduce_sum(dev, ndim, intToI64(srcTotal), intToI64(dstTotal), sh, sd, src, dst)
+
+pub def cudaUnaryFwd(dev: Int, op: Int, x: ForeignPtr, o: ForeignPtr, n: Int): Void = c_cu_unary_f(dev, op, x, o, intToI64(n))
+pub def cudaUnaryBwd(dev: Int, op: Int, x: ForeignPtr, y: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, n: Int): Void = c_cu_unary_b(dev, op, x, y, gy, gx, intToI64(n))
+pub def cudaSliceAxisFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void = c_cu_slice_f(dev, x, o, outer, inDim, inner, start, len)
+pub def cudaSliceAxisBwd(dev: Int, gy: ForeignPtr, gx: ForeignPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void = c_cu_slice_b(dev, gy, gx, outer, inDim, inner, start, len)
+pub def cudaSumAxis(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = c_cu_sum_ax(dev, x, o, outer, dim, inner)
+pub def cudaMaxAxis(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = c_cu_max_ax(dev, x, o, outer, dim, inner)
+pub def cudaSumAll(dev: Int, x: ForeignPtr, n: Int): Float = c_cu_sum_all(dev, x, intToI64(n))
+pub def cudaSumSq(dev: Int, x: ForeignPtr, n: Int): Float = c_cu_sum_sq(dev, x, intToI64(n))
+
+pub def cudaRmsNormFwd(dev: Int, x: ForeignPtr, w: ForeignPtr, o: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_rms_f(dev, x, w, o, rows, dim, floatToF32(eps))
+pub def cudaRmsNormBwd(dev: Int, x: ForeignPtr, w: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, gw: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_rms_b(dev, x, w, gy, gx, gw, rows, dim, floatToF32(eps))
+pub def cudaLayerNormFwd(dev: Int, x: ForeignPtr, w: ForeignPtr, b: ForeignPtr, o: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_ln_f(dev, x, w, b, o, rows, dim, floatToF32(eps))
+pub def cudaLayerNormBwd(dev: Int, x: ForeignPtr, w: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, gw: ForeignPtr, gb: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_ln_b(dev, x, w, gy, gx, gw, gb, rows, dim, floatToF32(eps))
+pub def cudaL2NormLastFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_l2_f(dev, x, o, rows, dim, floatToF32(eps))
+pub def cudaL2NormLastBwd(dev: Int, x: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, dim: Int, eps: Float): Void = c_cu_l2_b(dev, x, gy, gx, rows, dim, floatToF32(eps))
+pub def cudaSoftmaxFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, rows: Int, cols: Int): Void = c_cu_sm_f(dev, x, o, rows, cols)
+pub def cudaSoftmaxBwd(dev: Int, y: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void = c_cu_sm_b(dev, y, gy, gx, rows, cols)
+pub def cudaLogSumExpFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, rows: Int, cols: Int): Void = c_cu_lse_f(dev, x, o, rows, cols)
+pub def cudaLogSumExpBwd(dev: Int, x: ForeignPtr, lse: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, rows: Int, cols: Int): Void = c_cu_lse_b(dev, x, lse, gy, gx, rows, cols)
+pub def cudaCrossEntropyFwd(dev: Int, logits: ForeignPtr, targets: ForeignPtr, probsOut: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Float = c_cu_ce_f(dev, logits, targets, probsOut, rows, vocab, ignoreIdx)
+pub def cudaCrossEntropyBwd(dev: Int, probs: ForeignPtr, targets: ForeignPtr, gLoss: Float, gl: ForeignPtr, rows: Int, vocab: Int, ignoreIdx: Int): Void = c_cu_ce_b(dev, probs, targets, floatToF32(gLoss), gl, rows, vocab, ignoreIdx)
+pub def cudaEmbeddingFwd(dev: Int, tab: ForeignPtr, ids: ForeignPtr, o: ForeignPtr, nIds: Int, dim: Int): Void = c_cu_emb_f(dev, tab, ids, o, nIds, dim)
+pub def cudaEmbeddingBwd(dev: Int, ids: ForeignPtr, gy: ForeignPtr, gtab: ForeignPtr, nIds: Int, vocab: Int, dim: Int): Void = c_cu_emb_b(dev, ids, gy, gtab, nIds, vocab, dim)
+pub def cudaRope(dev: Int, x: ForeignPtr, o: ForeignPtr, b: Int, s: Int, h: Int, hd: Int, th: Float, bwd: Bool): Void =
+    if (bwd) c_cu_rope_b(dev, x, o, b, s, h, hd, floatToF32(th))
+    else c_cu_rope_f(dev, x, o, b, s, h, hd, floatToF32(th))
+pub def cudaTranspose2d(dev: Int, x: ForeignPtr, o: ForeignPtr, r: Int, c: Int): Void = c_cu_t2d(dev, x, o, r, c)
+pub def cudaTranspose0213(dev: Int, x: ForeignPtr, o: ForeignPtr, d0: Int, d1: Int, d2: Int, d3: Int): Void = c_cu_t0213(dev, x, o, d0, d1, d2, d3)
+pub def cudaCausalMaskAdd(dev: Int, s: ForeignPtr, bh: Int, seq: Int): Void = c_cu_causal(dev, s, bh, seq)
+pub def cudaRandn(dev: Int, dst: ForeignPtr, n: Int, seed: Int64, std: Float): Void = c_cu_randn(dev, dst, intToI64(n), seed, floatToF32(std))
+pub def cudaAdamwStep(
+    dev: Int, p: ForeignPtr, g: ForeignPtr, m: ForeignPtr, v: ForeignPtr,
+    po: ForeignPtr, mo: ForeignPtr, vo: ForeignPtr, n: Int,
+    lr: Float32, b1: Float32, b2: Float32, eps: Float32, wd: Float32, bc1: Float32, bc2: Float32
+): Void = c_cu_adamw(dev, p, g, m, v, po, mo, vo, intToI64(n), lr, b1, b2, eps, wd, bc1, bc2)

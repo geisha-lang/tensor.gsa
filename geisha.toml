@@ -4,6 +4,8 @@ src_dir = "src"
 tests = ["tests/spec.gsa"]
 
 [target.native]
+c_sources = ["native/cuda_weak_stubs.c"]
+c_flags = ["-O2"]
 
 [[target.native.when]]
 os = "macos"
@@ -17,6 +19,7 @@ link_flags = [
 
 [[target.native.when]]
 os = "linux"
+c_sources = ["native/metal_stubs_linux.c"]
 pkg_config = "openblas"
 
 [[target.native.when]]
@@ -25,4 +28,4 @@ compiler = "nvcc"
 c_sources = ["native/cuda.cu"]
 defines = ["GS_TENSOR_CUDA"]
 c_flags = ["-O3"]
-link_flags = ["-lcudart", "-lcublas"]
+link_flags = ["-L/usr/local/cuda/lib64", "-Wl,-rpath,/usr/local/cuda/lib64", "-lcudart", "-lcublas", "-lstdc++"]

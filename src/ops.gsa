@@ -3,7 +3,7 @@
 
 use std.option.{Option, Some, None}
 use std.list.{listLen, listRev}
-use tensor.backend.{Device, Cpu, sgemmCpu, bgemmCpu}
+use tensor.backend.{Device, Cpu, devId, sgemmCpu, bgemmCpu}
 use tensor.cpu.{
     cpuBinopSame, cpuScale, cpuAddScalar, cpuPowScalarFwd, cpuPowScalarBwd,
     cpuClampFwd, cpuClampBwd, cpuLeakyReluFwd, cpuLeakyReluBwd,
@@ -15,10 +15,22 @@ use tensor.cpu.{
     cpuEmbeddingFwd, cpuEmbeddingBwd, cpuRope,
     cpuTranspose2d, cpuTranspose0213, cpuCausalMaskAdd
 }
+use tensor.cuda.{
+    cudaSgemm, cudaBgemm, cudaBinopSame, cudaScale, cudaAddScalar,
+    cudaPowScalarFwd, cudaPowScalarBwd, cudaClampFwd, cudaClampBwd,
+    cudaLeakyReluFwd, cudaLeakyReluBwd, cudaBcastBinop, cudaBcastReduceSum,
+    cudaUnaryFwd, cudaUnaryBwd, cudaSliceAxisFwd, cudaSliceAxisBwd,
+    cudaSumAxis, cudaMaxAxis, cudaSumAll, cudaSumSq,
+    cudaRmsNormFwd, cudaRmsNormBwd, cudaLayerNormFwd, cudaLayerNormBwd,
+    cudaL2NormLastFwd, cudaL2NormLastBwd, cudaSoftmaxFwd, cudaSoftmaxBwd,
+    cudaLogSumExpFwd, cudaLogSumExpBwd, cudaCrossEntropyFwd, cudaCrossEntropyBwd,
+    cudaEmbeddingFwd, cudaEmbeddingBwd, cudaRope,
+    cudaTranspose2d, cudaTranspose0213, cudaCausalMaskAdd
+}
 use tensor.tensor.{
     Tensor, IntTensor, allocTensorOn, fullOn, zerosOn, cloneTensor, detach, item, axpyInPlace,
     shapeEq, dimAt, normalizeAxis, broadcastShape, broadcastStrides, packI32List, customVjp,
-    isMetal, syncDevice,
+    isMetal, isCuda, syncDevice,
     IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
     getActiveJitTrace, jitPushScalar, jitRecordNode
 }
@@ -33,31 +45,46 @@ use tensor.metal.{
 def unbroadcastRaw(g: Tensor, targetShape: List Int): Tensor =
     if (shapeEq(g.shape, targetShape)) g
     else {
-        syncDevice(g.device);
         let out = allocTensorOn(targetShape, g.device);
         let nd = listLen(g.shape);
         let shBuf = packI32List(g.shape);
         let stBuf = packI32List(broadcastStrides(targetShape, g.shape));
-        cpuBcastReduceSum(nd, g.numel, out.numel, shBuf, stBuf, g.buf, out.buf);
+        if (isCuda(g.device)) cudaBcastReduceSum(devId(g.device), nd, g.numel, out.numel, shBuf, stBuf, g.buf, out.buf)
+        else {
+            syncDevice(g.device);
+            cpuBcastReduceSum(nd, g.numel, out.numel, shBuf, stBuf, g.buf, out.buf)
+        };
         out
     }
 
 def rawBinop(op: Int, a: Tensor, b: Tensor): Tensor =
     if (shapeEq(a.shape, b.shape)) {
         let out = allocTensorOn(a.shape, a.device);
-        if (isMetal(a.device)) metalBinopSame(op, a.gpuBuf, b.gpuBuf, out.gpuBuf, a.numel)
+        if (isCuda(a.device)) cudaBinopSame(devId(a.device), op, a.buf, b.buf, out.buf, a.numel)
+        else if (isMetal(a.device)) metalBinopSame(op, a.gpuBuf, b.gpuBuf, out.gpuBuf, a.numel)
         else cpuBinopSame(op, a.buf, b.buf, out.buf, a.numel);
         out
     } else {
-        syncDevice(a.device);
         let outSh = broadcastShape(a.shape, b.shape);
         let out = allocTensorOn(outSh, a.device);
         let shBuf = packI32List(outSh);
         let saBuf = packI32List(broadcastStrides(a.shape, outSh));
         let sbBuf = packI32List(broadcastStrides(b.shape, outSh));
-        cpuBcastBinop(op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf);
+        if (isCuda(a.device)) cudaBcastBinop(devId(a.device), op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
+        else {
+            syncDevice(a.device);
+            cpuBcastBinop(op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
+        };
         out
     }
+
+def rawScaleTensor(a: Tensor, s: Float): Tensor = {
+    let out = allocTensorOn(a.shape, a.device);
+    if (isCuda(a.device)) cudaScale(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
+    else if (isMetal(a.device)) metalScaleOrAxpy("k_scale", a.gpuBuf, out.gpuBuf, floatToF32(s), a.numel)
+    else cpuScale(a.buf, floatToF32(s), out.buf, a.numel);
+    out
+}
 
 // ============================================================================
 // Broadcasting Arithmetic (`+`, `-`, `*`, `/`, `-x`) & Scalar Ops
@@ -87,8 +114,7 @@ pub def sub(a: Tensor, b: Tensor): Tensor =
             let out = rawBinop(1, a, b);
             let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
             customVjp([aid, bid], out, (g: Tensor) -> {
-                let ng = allocTensorOn(g.shape, g.device);
-                cpuScale(g.buf, floatToF32(-1.0), ng.buf, g.numel);
+                let ng = rawScaleTensor(g, -1.0);
                 [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(ng, bSh))]
             })
         },
@@ -96,8 +122,7 @@ pub def sub(a: Tensor, b: Tensor): Tensor =
             let out = rawBinop(1, a, b);
             let aid = a.nodeId; let bid = b.nodeId; let aSh = a.shape; let bSh = b.shape;
             customVjp([aid, bid], out, (g: Tensor) -> {
-                let ng = allocTensorOn(g.shape, g.device);
-                cpuScale(g.buf, floatToF32(-1.0), ng.buf, g.numel);
+                let ng = rawScaleTensor(g, -1.0);
                 [(aid, unbroadcastRaw(g, aSh)), (bid, unbroadcastRaw(ng, bSh))]
             })
         },
@@ -138,8 +163,7 @@ pub def divT(a: Tensor, b: Tensor): Tensor =
                 let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
                 let b2 = rawBinop(2, bd, bd);
                 let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
-                let gbNeg = allocTensorOn(gaRaw.shape, gaRaw.device);
-                cpuScale(gaRaw.buf, floatToF32(-1.0), gbNeg.buf, gaRaw.numel);
+                let gbNeg = rawScaleTensor(gaRaw, -1.0);
                 [(aid, ga), (bid, unbroadcastRaw(gbNeg, bd.shape))]
             })
         },
@@ -150,8 +174,7 @@ pub def divT(a: Tensor, b: Tensor): Tensor =
                 let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
                 let b2 = rawBinop(2, bd, bd);
                 let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
-                let gbNeg = allocTensorOn(gaRaw.shape, gaRaw.device);
-                cpuScale(gaRaw.buf, floatToF32(-1.0), gbNeg.buf, gaRaw.numel);
+                let gbNeg = rawScaleTensor(gaRaw, -1.0);
                 [(aid, ga), (bid, unbroadcastRaw(gbNeg, bd.shape))]
             })
         },
@@ -163,28 +186,14 @@ pub def scale(a: Tensor, s: Float): Tensor =
             let si = jitPushScalar(tr, s);
             jitRecordNode(tr, IrScale(a.irId, si), a.shape, a.device)
         } else {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isMetal(a.device)) metalScaleOrAxpy("k_scale", a.gpuBuf, out.gpuBuf, floatToF32(s), a.numel)
-            else cpuScale(a.buf, floatToF32(s), out.buf, a.numel);
+            let out = rawScaleTensor(a, s);
             let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(g.shape, g.device);
-                if (isMetal(g.device)) metalScaleOrAxpy("k_scale", g.gpuBuf, ga.gpuBuf, floatToF32(s), g.numel)
-                else cpuScale(g.buf, floatToF32(s), ga.buf, g.numel);
-                [(aid, ga)]
-            })
+            customVjp([aid], out, (g: Tensor) -> [(aid, rawScaleTensor(g, s))])
         },
         None -> {
-            let out = allocTensorOn(a.shape, a.device);
-            if (isMetal(a.device)) metalScaleOrAxpy("k_scale", a.gpuBuf, out.gpuBuf, floatToF32(s), a.numel)
-            else cpuScale(a.buf, floatToF32(s), out.buf, a.numel);
+            let out = rawScaleTensor(a, s);
             let aid = a.nodeId;
-            customVjp([aid], out, (g: Tensor) -> {
-                let ga = allocTensorOn(g.shape, g.device);
-                if (isMetal(g.device)) metalScaleOrAxpy("k_scale", g.gpuBuf, ga.gpuBuf, floatToF32(s), g.numel)
-                else cpuScale(g.buf, floatToF32(s), ga.buf, g.numel);
-                [(aid, ga)]
-            })
+            customVjp([aid], out, (g: Tensor) -> [(aid, rawScaleTensor(g, s))])
         },
     }
 
@@ -194,16 +203,16 @@ pub def addScalar(a: Tensor, s: Float): Tensor =
             let si = jitPushScalar(tr, s);
             jitRecordNode(tr, IrAddScalar(a.irId, si), a.shape, a.device)
         } else {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel);
+            if (isCuda(a.device)) cudaAddScalar(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
+            else { syncDevice(a.device); cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel) };
             let aid = a.nodeId;
             customVjp([aid], out, (g: Tensor) -> [(aid, g)])
         },
         None -> {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel);
+            if (isCuda(a.device)) cudaAddScalar(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
+            else { syncDevice(a.device); cpuAddScalar(a.buf, floatToF32(s), out.buf, a.numel) };
             let aid = a.nodeId;
             customVjp([aid], out, (g: Tensor) -> [(aid, g)])
         },
@@ -215,26 +224,26 @@ pub def powScalar(a: Tensor, p: Float): Tensor =
             let si = jitPushScalar(tr, p);
             jitRecordNode(tr, IrPowScalar(a.irId, si), a.shape, a.device)
         } else {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel);
+            if (isCuda(a.device)) cudaPowScalarFwd(devId(a.device), a.buf, floatToF32(p), out.buf, a.numel)
+            else { syncDevice(a.device); cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaPowScalarBwd(devId(g.device), ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
         None -> {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel);
+            if (isCuda(a.device)) cudaPowScalarFwd(devId(a.device), a.buf, floatToF32(p), out.buf, a.numel)
+            else { syncDevice(a.device); cpuPowScalarFwd(a.buf, floatToF32(p), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaPowScalarBwd(devId(g.device), ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuPowScalarBwd(ad.buf, g.buf, floatToF32(p), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
@@ -247,26 +256,26 @@ pub def clamp(a: Tensor, lo: Float, hi: Float): Tensor =
             let hsi = jitPushScalar(tr, hi);
             jitRecordNode(tr, IrClamp(a.irId, lsi, hsi), a.shape, a.device)
         } else {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel);
+            if (isCuda(a.device)) cudaClampFwd(devId(a.device), a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel)
+            else { syncDevice(a.device); cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaClampBwd(devId(g.device), ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
         None -> {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel);
+            if (isCuda(a.device)) cudaClampFwd(devId(a.device), a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel)
+            else { syncDevice(a.device); cpuClampFwd(a.buf, floatToF32(lo), floatToF32(hi), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaClampBwd(devId(g.device), ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuClampBwd(ad.buf, g.buf, floatToF32(lo), floatToF32(hi), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
@@ -278,26 +287,26 @@ pub def leakyRelu(a: Tensor, slope: Float): Tensor =
             let si = jitPushScalar(tr, slope);
             jitRecordNode(tr, IrLeakyRelu(a.irId, si), a.shape, a.device)
         } else {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel);
+            if (isCuda(a.device)) cudaLeakyReluFwd(devId(a.device), a.buf, floatToF32(slope), out.buf, a.numel)
+            else { syncDevice(a.device); cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaLeakyReluBwd(devId(g.device), ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
         None -> {
-            syncDevice(a.device);
             let out = allocTensorOn(a.shape, a.device);
-            cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel);
+            if (isCuda(a.device)) cudaLeakyReluFwd(devId(a.device), a.buf, floatToF32(slope), out.buf, a.numel)
+            else { syncDevice(a.device); cpuLeakyReluFwd(a.buf, floatToF32(slope), out.buf, a.numel) };
             let aid = a.nodeId; let ad = detach(a);
             customVjp([aid], out, (g: Tensor) -> {
-                syncDevice(g.device);
                 let ga = allocTensorOn(ad.shape, g.device);
-                cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel);
+                if (isCuda(g.device)) cudaLeakyReluBwd(devId(g.device), ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel)
+                else { syncDevice(g.device); cpuLeakyReluBwd(ad.buf, g.buf, floatToF32(slope), ga.buf, ad.numel) };
                 [(aid, ga)]
             })
         },
@@ -321,8 +330,11 @@ def unaryOp(op: Int, x: Tensor): Tensor =
             jitRecordNode(tr, IrUnary(op, x.irId), x.shape, x.device)
         } else {
             let out = allocTensorOn(x.shape, x.device);
+            let useCuda = isCuda(x.device);
             let useMetal = isMetal(x.device) && (op == 7 || op == 9 || op == 11);
-            if (useMetal) {
+            if (useCuda) {
+                cudaUnaryFwd(devId(x.device), op, x.buf, out.buf, x.numel)
+            } else if (useMetal) {
                 let kn = if (op == 7) "k_sigmoid_fwd" else if (op == 9) "k_silu_fwd" else "k_relu_fwd";
                 metalUnary2(kn, x.gpuBuf, out.gpuBuf, x.numel)
             } else {
@@ -332,7 +344,9 @@ def unaryOp(op: Int, x: Tensor): Tensor =
             let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
             customVjp([xid], out, (g: Tensor) -> {
                 let gx = allocTensorOn(xd.shape, g.device);
-                if (useMetal) {
+                if (useCuda) {
+                    cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
+                } else if (useMetal) {
                     if (op == 7) metalUnary3("k_sigmoid_bwd", yd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
                     else if (op == 9) metalUnary3("k_silu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
                     else metalUnary3("k_relu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
@@ -345,8 +359,11 @@ def unaryOp(op: Int, x: Tensor): Tensor =
         },
         None -> {
             let out = allocTensorOn(x.shape, x.device);
+            let useCuda = isCuda(x.device);
             let useMetal = isMetal(x.device) && (op == 7 || op == 9 || op == 11);
-            if (useMetal) {
+            if (useCuda) {
+                cudaUnaryFwd(devId(x.device), op, x.buf, out.buf, x.numel)
+            } else if (useMetal) {
                 let kn = if (op == 7) "k_sigmoid_fwd" else if (op == 9) "k_silu_fwd" else "k_relu_fwd";
                 metalUnary2(kn, x.gpuBuf, out.gpuBuf, x.numel)
             } else {
@@ -356,7 +373,9 @@ def unaryOp(op: Int, x: Tensor): Tensor =
             let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
             customVjp([xid], out, (g: Tensor) -> {
                 let gx = allocTensorOn(xd.shape, g.device);
-                if (useMetal) {
+                if (useCuda) {
+                    cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
+                } else if (useMetal) {
                     if (op == 7) metalUnary3("k_sigmoid_bwd", yd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
                     else if (op == 9) metalUnary3("k_silu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
                     else metalUnary3("k_relu_bwd", xd.gpuBuf, g.gpuBuf, gx.gpuBuf, xd.numel)
@@ -394,11 +413,13 @@ def replaceLastDim(sh: List Int, newLast: Int): List Int = match sh {
 }
 
 def dispatchSgemm(ta: Bool, tb: Bool, m: Int, n: Int, k: Int, a: Tensor, b: Tensor, out: Tensor): Void =
-    if (isMetal(a.device)) metalSgemm(ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, 0.0, out.gpuBuf)
+    if (isCuda(a.device)) cudaSgemm(devId(a.device), ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
+    else if (isMetal(a.device)) metalSgemm(ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, 0.0, out.gpuBuf)
     else sgemmCpu(ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
 
 def dispatchBgemm(batch: Int, ta: Bool, tb: Bool, m: Int, n: Int, k: Int, a: Tensor, b: Tensor, out: Tensor): Void =
-    if (isMetal(a.device)) metalBgemm(batch, ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, 0.0, out.gpuBuf)
+    if (isCuda(a.device)) cudaBgemm(devId(a.device), batch, ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
+    else if (isMetal(a.device)) metalBgemm(batch, ta, tb, m, n, k, 1.0, a.gpuBuf, b.gpuBuf, 0.0, out.gpuBuf)
     else bgemmCpu(batch, ta, tb, m, n, k, floatToF32(1.0), a.buf, b.buf, floatToF32(0.0), out.buf)
 
 pub def matmul(a: Tensor, b: Tensor): Tensor = {
@@ -516,33 +537,33 @@ pub def squeeze(t: Tensor, axis: Int): Tensor = {
 }
 
 pub def transpose2d(t: Tensor): Tensor = {
-    syncDevice(t.device);
     let r = dimAt(t.shape, 0);
     let c = dimAt(t.shape, 1);
     let out = allocTensorOn([c, r], t.device);
-    cpuTranspose2d(t.buf, out.buf, r, c);
+    if (isCuda(t.device)) cudaTranspose2d(devId(t.device), t.buf, out.buf, r, c)
+    else { syncDevice(t.device); cpuTranspose2d(t.buf, out.buf, r, c) };
     let tid = t.nodeId;
     customVjp([tid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn([r, c], g.device);
-        cpuTranspose2d(g.buf, gx.buf, c, r);
+        if (isCuda(g.device)) cudaTranspose2d(devId(g.device), g.buf, gx.buf, c, r)
+        else { syncDevice(g.device); cpuTranspose2d(g.buf, gx.buf, c, r) };
         [(tid, gx)]
     })
 }
 
 pub def transpose0213(t: Tensor): Tensor = {
-    syncDevice(t.device);
     let d0 = dimAt(t.shape, 0);
     let d1 = dimAt(t.shape, 1);
     let d2 = dimAt(t.shape, 2);
     let d3 = dimAt(t.shape, 3);
     let out = allocTensorOn([d0, d2, d1, d3], t.device);
-    cpuTranspose0213(t.buf, out.buf, d0, d1, d2, d3);
+    if (isCuda(t.device)) cudaTranspose0213(devId(t.device), t.buf, out.buf, d0, d1, d2, d3)
+    else { syncDevice(t.device); cpuTranspose0213(t.buf, out.buf, d0, d1, d2, d3) };
     let tid = t.nodeId;
     customVjp([tid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn([d0, d1, d2, d3], g.device);
-        cpuTranspose0213(g.buf, gx.buf, d0, d2, d1, d3);
+        if (isCuda(g.device)) cudaTranspose0213(devId(g.device), g.buf, gx.buf, d0, d2, d1, d3)
+        else { syncDevice(g.device); cpuTranspose0213(g.buf, gx.buf, d0, d2, d1, d3) };
         [(tid, gx)]
     })
 }
@@ -573,12 +594,14 @@ pub def sliceAxis(x: Tensor, axis: Int, start: Int, len: Int): Tensor = {
     let (outer, inDim, inner) = axisOuterInner(x.shape, ax);
     let outSh = setAt(x.shape, ax, len);
     let out = allocTensorOn(outSh, x.device);
-    cpuSliceAxisFwd(x.buf, out.buf, outer, inDim, inner, start, len);
+    if (isCuda(x.device)) cudaSliceAxisFwd(devId(x.device), x.buf, out.buf, outer, inDim, inner, start, len)
+    else { syncDevice(x.device); cpuSliceAxisFwd(x.buf, out.buf, outer, inDim, inner, start, len) };
     let xid = x.nodeId;
     let xSh = x.shape;
     customVjp([xid], out, (g: Tensor) -> {
         let gx = allocTensorOn(xSh, g.device);
-        cpuSliceAxisBwd(g.buf, gx.buf, outer, inDim, inner, start, len);
+        if (isCuda(g.device)) cudaSliceAxisBwd(devId(g.device), g.buf, gx.buf, outer, inDim, inner, start, len)
+        else { syncDevice(g.device); cpuSliceAxisBwd(g.buf, gx.buf, outer, inDim, inner, start, len) };
         [(xid, gx)]
     })
 }
@@ -626,7 +649,8 @@ pub def catAxis(xs: List Tensor, axis: Int): Tensor = match xs {
                 Cons(t, r) -> {
                     let len = dimAt(t.shape, ax);
                     let tmp = allocTensorOn(outSh, first.device);
-                    cpuSliceAxisBwd(t.buf, tmp.buf, outer, outDim, inner, cellGet(off), len);
+                    if (isCuda(first.device)) cudaSliceAxisBwd(devId(first.device), t.buf, tmp.buf, outer, outDim, inner, cellGet(off), len)
+                    else { syncDevice(t.device); cpuSliceAxisBwd(t.buf, tmp.buf, outer, outDim, inner, cellGet(off), len) };
                     axpyInPlace(1.0, tmp, out);
                     cellSet(off, cellGet(off) + len);
                     cellSet(cur2, r)
@@ -656,7 +680,8 @@ pub def catAxis(xs: List Tensor, axis: Int): Tensor = match xs {
                 match cellGet(cs) {
                     Cons((tid, st, ln, tSh), rs) -> {
                         let gt = allocTensorOn(tSh, g.device);
-                        cpuSliceAxisFwd(g.buf, gt.buf, outer, outDim, inner, st, ln);
+                        if (isCuda(g.device)) cudaSliceAxisFwd(devId(g.device), g.buf, gt.buf, outer, outDim, inner, st, ln)
+                        else { syncDevice(g.device); cpuSliceAxisFwd(g.buf, gt.buf, outer, outDim, inner, st, ln) };
                         cellSet(resRev, Cons((tid, gt), cellGet(resRev)));
                         cellSet(cs, rs)
                     },
@@ -687,8 +712,8 @@ pub def padAxis(x: Tensor, axis: Int, padLeft: Int, padRight: Int, val: Float): 
 // ============================================================================
 
 pub def sumAll(x: Tensor): Tensor = {
-    syncDevice(x.device);
-    let v = cpuSumAll(x.buf, x.numel);
+    let v = if (isCuda(x.device)) cudaSumAll(devId(x.device), x.buf, x.numel)
+            else { syncDevice(x.device); cpuSumAll(x.buf, x.numel) };
     let out = fullOn([1], v, x.device);
     let xid = x.nodeId;
     let xShape = x.shape;
@@ -699,13 +724,13 @@ pub def sumAll(x: Tensor): Tensor = {
 pub def meanAll(x: Tensor): Tensor = scale(sumAll(x), 1.0 / intToFloat(x.numel))
 
 pub def sumAxis(x: Tensor, axis: Int, keepDim: Bool): Tensor = {
-    syncDevice(x.device);
     let ax = normalizeAxis(listLen(x.shape), axis);
     let (outer, dim, inner) = axisOuterInner(x.shape, ax);
     let keepSh = setAt(x.shape, ax, 1);
     let outSh = if (keepDim) keepSh else removeAt(x.shape, ax);
     let out = allocTensorOn(outSh, x.device);
-    cpuSumAxis(x.buf, out.buf, outer, dim, inner);
+    if (isCuda(x.device)) cudaSumAxis(devId(x.device), x.buf, out.buf, outer, dim, inner)
+    else { syncDevice(x.device); cpuSumAxis(x.buf, out.buf, outer, dim, inner) };
     let xid = x.nodeId;
     let xSh = x.shape;
     customVjp([xid], out, (g: Tensor) -> {
@@ -726,7 +751,8 @@ pub def maxAxis(x: Tensor, axis: Int, keepDim: Bool): Tensor = {
     let (outer, dim, inner) = axisOuterInner(x.shape, ax);
     let outSh = if (keepDim) setAt(x.shape, ax, 1) else removeAt(x.shape, ax);
     let out = allocTensorOn(outSh, x.device);
-    cpuMaxAxis(x.buf, out.buf, outer, dim, inner);
+    if (isCuda(x.device)) cudaMaxAxis(devId(x.device), x.buf, out.buf, outer, dim, inner)
+    else { syncDevice(x.device); cpuMaxAxis(x.buf, out.buf, outer, dim, inner) };
     out
 }
 
@@ -736,50 +762,51 @@ pub def logSumExpLast(x: Tensor): Tensor = {
     let rows = x.numel / cols;
     let outSh = removeAt(x.shape, rank - 1);
     let out = allocTensorOn(if (listLen(outSh) == 0) [1] else outSh, x.device);
-    cpuLogSumExpFwd(x.buf, out.buf, rows, cols);
+    if (isCuda(x.device)) cudaLogSumExpFwd(devId(x.device), x.buf, out.buf, rows, cols)
+    else { syncDevice(x.device); cpuLogSumExpFwd(x.buf, out.buf, rows, cols) };
     let xid = x.nodeId;
     let xd = detach(x);
     let lseD = detach(out);
     customVjp([xid], out, (g: Tensor) -> {
         let gx = allocTensorOn(xd.shape, g.device);
-        cpuLogSumExpBwd(xd.buf, lseD.buf, g.buf, gx.buf, rows, cols);
+        if (isCuda(g.device)) cudaLogSumExpBwd(devId(g.device), xd.buf, lseD.buf, g.buf, gx.buf, rows, cols)
+        else { syncDevice(g.device); cpuLogSumExpBwd(xd.buf, lseD.buf, g.buf, gx.buf, rows, cols) };
         [(xid, gx)]
     })
 }
 
-pub def sumSqFloat(x: Tensor): Float = {
-    syncDevice(x.device);
-    cpuSumSq(x.buf, x.numel)
-}
+pub def sumSqFloat(x: Tensor): Float =
+    if (isCuda(x.device)) cudaSumSq(devId(x.device), x.buf, x.numel)
+    else { syncDevice(x.device); cpuSumSq(x.buf, x.numel) }
 
 pub def l2NormFloat(x: Tensor): Float =
     f32ToFloat(mathSqrtF32(floatToF32(sumSqFloat(x))))
 
 pub def rmsNorm(x: Tensor, w: Tensor, eps: Float): Tensor = {
-    syncDevice(x.device);
     let dim = w.numel;
     let rows = x.numel / dim;
     let out = allocTensorOn(x.shape, x.device);
-    cpuRmsNormFwd(x.buf, w.buf, out.buf, rows, dim, eps);
+    if (isCuda(x.device)) cudaRmsNormFwd(devId(x.device), x.buf, w.buf, out.buf, rows, dim, eps)
+    else { syncDevice(x.device); cpuRmsNormFwd(x.buf, w.buf, out.buf, rows, dim, eps) };
     let xid = x.nodeId;
     let wid = w.nodeId;
     let xd = detach(x);
     let wd = detach(w);
     customVjp([xid, wid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn(xd.shape, g.device);
         let gw = allocTensorOn(wd.shape, g.device);
-        cpuRmsNormBwd(xd.buf, wd.buf, g.buf, gx.buf, gw.buf, rows, dim, eps);
+        if (isCuda(g.device)) cudaRmsNormBwd(devId(g.device), xd.buf, wd.buf, g.buf, gx.buf, gw.buf, rows, dim, eps)
+        else { syncDevice(g.device); cpuRmsNormBwd(xd.buf, wd.buf, g.buf, gx.buf, gw.buf, rows, dim, eps) };
         [(xid, gx), (wid, gw)]
     })
 }
 
 pub def layerNorm(x: Tensor, w: Tensor, b: Tensor, eps: Float): Tensor = {
-    syncDevice(x.device);
     let dim = w.numel;
     let rows = x.numel / dim;
     let out = allocTensorOn(x.shape, x.device);
-    cpuLayerNormFwd(x.buf, w.buf, b.buf, out.buf, rows, dim, eps);
+    if (isCuda(x.device)) cudaLayerNormFwd(devId(x.device), x.buf, w.buf, b.buf, out.buf, rows, dim, eps)
+    else { syncDevice(x.device); cpuLayerNormFwd(x.buf, w.buf, b.buf, out.buf, rows, dim, eps) };
     let xid = x.nodeId;
     let wid = w.nodeId;
     let bid = b.nodeId;
@@ -787,43 +814,43 @@ pub def layerNorm(x: Tensor, w: Tensor, b: Tensor, eps: Float): Tensor = {
     let wd = detach(w);
     let bSh = b.shape;
     customVjp([xid, wid, bid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn(xd.shape, g.device);
         let gw = allocTensorOn(wd.shape, g.device);
         let gb = allocTensorOn(bSh, g.device);
-        cpuLayerNormBwd(xd.buf, wd.buf, g.buf, gx.buf, gw.buf, gb.buf, rows, dim, eps);
+        if (isCuda(g.device)) cudaLayerNormBwd(devId(g.device), xd.buf, wd.buf, g.buf, gx.buf, gw.buf, gb.buf, rows, dim, eps)
+        else { syncDevice(g.device); cpuLayerNormBwd(xd.buf, wd.buf, g.buf, gx.buf, gw.buf, gb.buf, rows, dim, eps) };
         [(xid, gx), (wid, gw), (bid, gb)]
     })
 }
 
 pub def l2NormLast(x: Tensor, eps: Float): Tensor = {
-    syncDevice(x.device);
     let cols = dimAt(x.shape, listLen(x.shape) - 1);
     let rows = x.numel / cols;
     let out = allocTensorOn(x.shape, x.device);
-    cpuL2NormLastFwd(x.buf, out.buf, rows, cols, eps);
+    if (isCuda(x.device)) cudaL2NormLastFwd(devId(x.device), x.buf, out.buf, rows, cols, eps)
+    else { syncDevice(x.device); cpuL2NormLastFwd(x.buf, out.buf, rows, cols, eps) };
     let xid = x.nodeId;
     let xd = detach(x);
     customVjp([xid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn(xd.shape, g.device);
-        cpuL2NormLastBwd(xd.buf, g.buf, gx.buf, rows, cols, eps);
+        if (isCuda(g.device)) cudaL2NormLastBwd(devId(g.device), xd.buf, g.buf, gx.buf, rows, cols, eps)
+        else { syncDevice(g.device); cpuL2NormLastBwd(xd.buf, g.buf, gx.buf, rows, cols, eps) };
         [(xid, gx)]
     })
 }
 
 pub def softmax(x: Tensor): Tensor = {
-    syncDevice(x.device);
     let cols = dimAt(x.shape, listLen(x.shape) - 1);
     let rows = x.numel / cols;
     let out = allocTensorOn(x.shape, x.device);
-    cpuSoftmaxFwd(x.buf, out.buf, rows, cols);
+    if (isCuda(x.device)) cudaSoftmaxFwd(devId(x.device), x.buf, out.buf, rows, cols)
+    else { syncDevice(x.device); cpuSoftmaxFwd(x.buf, out.buf, rows, cols) };
     let xid = x.nodeId;
     let yd = detach(out);
     customVjp([xid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn(yd.shape, g.device);
-        cpuSoftmaxBwd(yd.buf, g.buf, gx.buf, rows, cols);
+        if (isCuda(g.device)) cudaSoftmaxBwd(devId(g.device), yd.buf, g.buf, gx.buf, rows, cols)
+        else { syncDevice(g.device); cpuSoftmaxBwd(yd.buf, g.buf, gx.buf, rows, cols) };
         [(xid, gx)]
     })
 }
@@ -831,17 +858,18 @@ pub def softmax(x: Tensor): Tensor = {
 pub def logSoftmax(x: Tensor): Tensor = sub(x, unsqueeze(logSumExpLast(x), -1))
 
 pub def crossEntropyIgnore(logits: Tensor, targets: IntTensor, ignoreIndex: Int): Tensor = {
-    syncDevice(logits.device);
     let vocab = dimAt(logits.shape, listLen(logits.shape) - 1);
     let rows = logits.numel / vocab;
     let probs = allocTensorOn(logits.shape, logits.device);
-    let lossVal = cpuCrossEntropyFwd(logits.buf, targets.buf, probs.buf, rows, vocab, ignoreIndex);
+    let lossVal = if (isCuda(logits.device)) cudaCrossEntropyFwd(devId(logits.device), logits.buf, targets.buf, probs.buf, rows, vocab, ignoreIndex)
+                  else { syncDevice(logits.device); cpuCrossEntropyFwd(logits.buf, targets.buf, probs.buf, rows, vocab, ignoreIndex) };
     let out = fullOn([1], lossVal, logits.device);
     let lid = logits.nodeId;
     let lShape = logits.shape;
     customVjp([lid], out, (g: Tensor) -> {
         let gl = allocTensorOn(lShape, logits.device);
-        cpuCrossEntropyBwd(probs.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex);
+        if (isCuda(logits.device)) cudaCrossEntropyBwd(devId(logits.device), probs.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex)
+        else { syncDevice(logits.device); cpuCrossEntropyBwd(probs.buf, targets.buf, item(g), gl.buf, rows, vocab, ignoreIndex) };
         [(lid, gl)]
     })
 }
@@ -853,45 +881,45 @@ pub def mseLoss(pred: Tensor, target: Tensor): Tensor =
     meanAll(square(sub(pred, target)))
 
 pub def embedding(table: Tensor, ids: IntTensor): Tensor = {
-    syncDevice(table.device);
     let vocab = dimAt(table.shape, 0);
     let dim = dimAt(table.shape, 1);
     let nIds = ids.numel;
     let outShape = listRev(Cons(dim, listRev(ids.shape)));
     let out = allocTensorOn(outShape, table.device);
-    cpuEmbeddingFwd(table.buf, ids.buf, out.buf, nIds, dim);
+    if (isCuda(table.device)) cudaEmbeddingFwd(devId(table.device), table.buf, ids.buf, out.buf, nIds, dim)
+    else { syncDevice(table.device); cpuEmbeddingFwd(table.buf, ids.buf, out.buf, nIds, dim) };
     let tid = table.nodeId;
     customVjp([tid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gt = allocTensorOn([vocab, dim], table.device);
-        cpuEmbeddingBwd(ids.buf, g.buf, gt.buf, nIds, vocab, dim);
+        if (isCuda(table.device)) cudaEmbeddingBwd(devId(table.device), ids.buf, g.buf, gt.buf, nIds, vocab, dim)
+        else { syncDevice(g.device); cpuEmbeddingBwd(ids.buf, g.buf, gt.buf, nIds, vocab, dim) };
         [(tid, gt)]
     })
 }
 
 pub def rope(x: Tensor, theta: Float): Tensor = {
-    syncDevice(x.device);
     let b = dimAt(x.shape, 0);
     let s = dimAt(x.shape, 1);
     let h = dimAt(x.shape, 2);
     let hd = dimAt(x.shape, 3);
     let out = allocTensorOn(x.shape, x.device);
-    cpuRope(x.buf, out.buf, b, s, h, hd, theta, false);
+    if (isCuda(x.device)) cudaRope(devId(x.device), x.buf, out.buf, b, s, h, hd, theta, false)
+    else { syncDevice(x.device); cpuRope(x.buf, out.buf, b, s, h, hd, theta, false) };
     let xid = x.nodeId;
     customVjp([xid], out, (g: Tensor) -> {
-        syncDevice(g.device);
         let gx = allocTensorOn([b, s, h, hd], g.device);
-        cpuRope(g.buf, gx.buf, b, s, h, hd, theta, true);
+        if (isCuda(g.device)) cudaRope(devId(g.device), g.buf, gx.buf, b, s, h, hd, theta, true)
+        else { syncDevice(g.device); cpuRope(g.buf, gx.buf, b, s, h, hd, theta, true) };
         [(xid, gx)]
     })
 }
 
 pub def causalMask(scores: Tensor): Tensor = {
-    syncDevice(scores.device);
     let bh = dimAt(scores.shape, 0);
     let seq = dimAt(scores.shape, 1);
     let out = cloneTensor(scores);
-    cpuCausalMaskAdd(out.buf, bh, seq);
+    if (isCuda(scores.device)) cudaCausalMaskAdd(devId(scores.device), out.buf, bh, seq)
+    else { syncDevice(scores.device); cpuCausalMaskAdd(out.buf, bh, seq) };
     let sid = scores.nodeId;
     customVjp([sid], out, (g: Tensor) -> [(sid, g)])
 }

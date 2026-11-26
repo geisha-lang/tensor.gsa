@@ -7,6 +7,10 @@ use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
 use tensor.backend.{Device, Cpu, Cuda, Metal, devKind, devId, cudaAvailable, autoDevice}
 use tensor.cpu.{cpuFill, cpuCopy, cpuRandn, cpuAxpy, cpuAdamwStep}
 use tensor.metal.{metalAllocShared, metalSync, metalScaleOrAxpy}
+use tensor.cuda.{
+    cudaAllocBuf, cudaSync, cudaH2d, cudaD2h, cudaD2d,
+    cudaFill, cudaCopy, cudaRandn, cudaAxpy, cudaAdamwStep
+}
 
 // ============================================================================
 // Tensor & IntTensor Types
@@ -211,8 +215,14 @@ pub def isMetal(d: Device): Bool = match d {
     _ -> false,
 }
 
+pub def isCuda(d: Device): Bool = match d {
+    Cuda(_) -> true,
+    _ -> false,
+}
+
 pub def syncDevice(d: Device): Void = match d {
     Metal(_) -> metalSync(),
+    Cuda(id) -> cudaSync(id),
     _ -> (),
 }
 
@@ -224,6 +234,10 @@ pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
             let (cpuView, gpuOwner) = metalAllocShared(nb);
             Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
         },
+        Cuda(id) -> {
+            let cbuf = cudaAllocBuf(id, nb);
+            Tensor { buf: cbuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
+        },
         _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 },
     }
 }
@@ -233,7 +247,10 @@ pub def zeros(sh: List Int): Tensor = zerosOn(sh, Cpu)
 
 pub def fullOn(sh: List Int, val: Float, dev: Device): Tensor = {
     let t = allocTensorOn(sh, dev);
-    cpuFill(t.buf, t.numel, floatToF32(val));
+    match dev {
+        Cuda(id) -> cudaFill(id, t.buf, t.numel, floatToF32(val)),
+        _ -> cpuFill(t.buf, t.numel, floatToF32(val)),
+    };
     t
 }
 
@@ -245,7 +262,10 @@ pub def onesLike(t: Tensor): Tensor = onesOn(t.shape, t.device)
 
 pub def randnOn(sh: List Int, seed: Int64, std: Float, dev: Device): Tensor = {
     let t = allocTensorOn(sh, dev);
-    cpuRandn(t.buf, t.numel, seed, std);
+    match dev {
+        Cuda(id) -> cudaRandn(id, t.buf, t.numel, seed, std),
+        _ -> cpuRandn(t.buf, t.numel, seed, std),
+    };
     t
 }
 
@@ -285,8 +305,8 @@ pub def fromList(sh: List Int, xs: List Float): Tensor = {
 pub def fromI32ListOn(sh: List Int, xs: List Int, dev: Device): IntTensor = {
     let n = shapeProd(sh);
     let nb = intToI64(n) * intToI64(4);
-    let buf = allocBuf(dev, nb);
-    withForeignPtr(buf, (sp) -> {
+    let hostBuf = allocBuf(Cpu, nb);
+    withForeignPtr(hostBuf, (sp) -> {
         let cur = cellNew(xs);
         let i = cellNew(0);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -300,58 +320,137 @@ pub def fromI32ListOn(sh: List Int, xs: List Int, dev: Device): IntTensor = {
             }
         }
     });
-    IntTensor { buf: buf, shape: sh, numel: n, device: dev }
+    match dev {
+        Cuda(id) -> {
+            let devBuf = cudaAllocBuf(id, nb);
+            cudaH2d(id, devBuf, hostBuf, nb);
+            IntTensor { buf: devBuf, shape: sh, numel: n, device: dev }
+        },
+        _ -> IntTensor { buf: hostBuf, shape: sh, numel: n, device: dev },
+    }
 }
 
 pub def fromI32List(sh: List Int, xs: List Int): IntTensor = fromI32ListOn(sh, xs, Cpu)
+
+pub def tensorFromHostBufOn(sh: List Int, hostBuf: ForeignPtr, dev: Device): Tensor = {
+    let n = shapeProd(sh);
+    let nb = intToI64(n) * intToI64(4);
+    match dev {
+        Cuda(id) -> {
+            let devBuf = cudaAllocBuf(id, nb);
+            cudaH2d(id, devBuf, hostBuf, nb);
+            Tensor { buf: devBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
+        },
+        Metal(_) -> {
+            let out = allocTensorOn(sh, dev);
+            cpuCopy(out.buf, hostBuf, n);
+            out
+        },
+        _ -> Tensor { buf: hostBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 },
+    }
+}
+
+pub def intTensorFromHostBufOn(sh: List Int, hostBuf: ForeignPtr, dev: Device): IntTensor = {
+    let n = shapeProd(sh);
+    let nb = intToI64(n) * intToI64(4);
+    match dev {
+        Cuda(id) -> {
+            let devBuf = cudaAllocBuf(id, nb);
+            cudaH2d(id, devBuf, hostBuf, nb);
+            IntTensor { buf: devBuf, shape: sh, numel: n, device: dev }
+        },
+        _ -> IntTensor { buf: hostBuf, shape: sh, numel: n, device: dev },
+    }
+}
 
 pub def tensorDevice(t: Tensor): Device = t.device
 
 pub def toDevice(t: Tensor, dev: Device): Tensor =
     if (t.device == dev) t
     else {
-        syncDevice(t.device);
-        let out = allocTensorOn(t.shape, dev);
-        cpuCopy(out.buf, t.buf, t.numel);
-        out
+        let nb = intToI64(t.numel) * intToI64(4);
+        match (t.device, dev) {
+            (Cuda(id1), Cuda(id2)) -> {
+                let out = allocTensorOn(t.shape, dev);
+                if (id1 == id2) cudaD2d(id1, out.buf, t.buf, nb)
+                else {
+                    let tmp = allocBuf(Cpu, nb);
+                    cudaD2h(id1, tmp, t.buf, nb);
+                    cudaH2d(id2, out.buf, tmp, nb)
+                };
+                out
+            },
+            (Cuda(id), _) -> {
+                let out = allocTensorOn(t.shape, dev);
+                cudaD2h(id, out.buf, t.buf, nb);
+                out
+            },
+            (_, Cuda(id)) -> {
+                syncDevice(t.device);
+                let out = allocTensorOn(t.shape, dev);
+                cudaH2d(id, out.buf, t.buf, nb);
+                out
+            },
+            _ -> {
+                syncDevice(t.device);
+                let out = allocTensorOn(t.shape, dev);
+                cpuCopy(out.buf, t.buf, t.numel);
+                out
+            },
+        }
     }
 
 pub def detach(t: Tensor): Tensor =
     Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1, irId: -1 }
 
-pub def getAt(t: Tensor, idx: Int): Float = {
-    syncDevice(t.device);
-    withForeignPtr(t.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
+pub def getAt(t: Tensor, idx: Int): Float = match t.device {
+    Cuda(_) -> {
+        let host = toDevice(t, Cpu);
+        withForeignPtr(host.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
+    },
+    _ -> {
+        syncDevice(t.device);
+        withForeignPtr(t.buf, (sp) -> f32ToFloat(scopedPtrReadF32Le(sp, idx * 4)))
+    },
 }
 
 pub def item(t: Tensor): Float = getAt(t, 0)
 
-pub def toList(t: Tensor): List Float = {
-    syncDevice(t.device);
-    withForeignPtr(t.buf, (sp) -> {
-        let acc = cellNew(Nil);
-        let i = cellNew(t.numel - 1);
-        while (cellGet(i) >= 0) {
-            let v = f32ToFloat(scopedPtrReadF32Le(sp, cellGet(i) * 4));
-            cellSet(acc, Cons(v, cellGet(acc)));
-            cellSet(i, cellGet(i) - 1)
-        };
-        cellGet(acc)
-    })
+pub def toList(t: Tensor): List Float = match t.device {
+    Cuda(_) -> toList(toDevice(t, Cpu)),
+    _ -> {
+        syncDevice(t.device);
+        withForeignPtr(t.buf, (sp) -> {
+            let acc = cellNew(Nil);
+            let i = cellNew(t.numel - 1);
+            while (cellGet(i) >= 0) {
+                let v = f32ToFloat(scopedPtrReadF32Le(sp, cellGet(i) * 4));
+                cellSet(acc, Cons(v, cellGet(acc)));
+                cellSet(i, cellGet(i) - 1)
+            };
+            cellGet(acc)
+        })
+    },
 }
 
-pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void =
-    if (isMetal(y.device)) {
-        metalScaleOrAxpy("k_axpy", x.gpuBuf, y.gpuBuf, floatToF32(alpha), y.numel)
-    } else {
-        cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel)
-    }
+pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void = match y.device {
+    Cuda(id) -> cudaAxpy(id, floatToF32(alpha), x.buf, y.buf, y.numel),
+    Metal(_) -> metalScaleOrAxpy("k_axpy", x.gpuBuf, y.gpuBuf, floatToF32(alpha), y.numel),
+    _ -> cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel),
+}
 
-pub def cloneTensor(t: Tensor): Tensor = {
-    syncDevice(t.device);
-    let out = allocTensorOn(t.shape, t.device);
-    cpuCopy(out.buf, t.buf, t.numel);
-    out
+pub def cloneTensor(t: Tensor): Tensor = match t.device {
+    Cuda(id) -> {
+        let out = allocTensorOn(t.shape, t.device);
+        cudaCopy(id, out.buf, t.buf, t.numel);
+        out
+    },
+    _ -> {
+        syncDevice(t.device);
+        let out = allocTensorOn(t.shape, t.device);
+        cpuCopy(out.buf, t.buf, t.numel);
+        out
+    },
 }
 
 pub def adamwStepRaw(
@@ -361,13 +460,21 @@ pub def adamwStepRaw(
     let pOut = allocTensorOn(p.shape, p.device);
     let mOut = allocTensorOn(m.shape, m.device);
     let vOut = allocTensorOn(v.shape, v.device);
-    cpuAdamwStep(
-        p.buf, g.buf, m.buf, v.buf,
-        pOut.buf, mOut.buf, vOut.buf,
-        p.numel,
-        floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
-        floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
-    );
+    match p.device {
+        Cuda(id) -> cudaAdamwStep(
+            id, p.buf, g.buf, m.buf, v.buf,
+            pOut.buf, mOut.buf, vOut.buf, p.numel,
+            floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
+            floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
+        ),
+        _ -> cpuAdamwStep(
+            p.buf, g.buf, m.buf, v.buf,
+            pOut.buf, mOut.buf, vOut.buf,
+            p.numel,
+            floatToF32(lr), floatToF32(beta1), floatToF32(beta2),
+            floatToF32(eps), floatToF32(wd), floatToF32(bc1), floatToF32(bc2)
+        ),
+    };
     (pOut, mOut, vOut)
 }
 
