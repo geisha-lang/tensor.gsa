@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-24.04
+          - label: darwin-arm64
+            os: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang & OpenBLAS (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
+          sudo apt-get update
+          sudo apt-get install -y clang xz-utils pkg-config libopenblas-dev
+
+      - name: Ensure xz is installed (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          command -v xz >/dev/null 2>&1 || brew install xz
+
+      - name: Resolve Geisha compiler commit
+        id: geisha-rev
+        run: |
+          SHA="$(git ls-remote https://github.com/geisha-lang/geisha.gsa.git refs/heads/main | awk '{print $1}')"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Geisha toolchain
+        id: cache-geisha
+        uses: actions/cache@v4
+        with:
+          path: ~/.geisha
+          key: geisha-tensor-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.geisha-rev.outputs.sha }}
+
+      - name: Build Geisha toolchain (on cache miss)
+        if: steps.cache-geisha.outputs.cache-hit != 'true'
+        run: |
+          SRC="$(mktemp -d)"
+          git clone --depth 1 https://github.com/geisha-lang/geisha.gsa.git "$SRC"
+          make -C "$SRC" runtime stage1 stage2
+          mkdir -p "$HOME/.geisha/bin" "$HOME/.geisha/lib"
+          cp "$SRC/build/geisha2" "$HOME/.geisha/bin/geisha"
+          cp "$SRC/build/libgeisha_runtime.a" "$HOME/.geisha/lib/libgeisha_runtime.a"
+          rm -rf "$SRC"
+
+      - name: Add Geisha to PATH
+        run: echo "$HOME/.geisha/bin" >> "$GITHUB_PATH"
+
+      - name: Typecheck, docs & full AD/CPU/Metal/JIT/Safetensors test suite
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          geisha check
+          geisha doc tensor.tensor >/dev/null
+          geisha doc tensor.ops >/dev/null
+          geisha test

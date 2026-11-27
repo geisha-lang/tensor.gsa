@@ -1,5 +1,16 @@
 # tensor.gsa — Architecture & Engineering Rules
 
+## Branch, Worktree & Pull Request Workflow (No Direct Push to `main`)
+
+`main` is protected on GitHub and gated by `Test (linux-x86_64)` and `Test (darwin-arm64)`.
+
+1. **Never edit or commit directly on `main` in `~/code/tensor.gsa`**:
+   - Keep `~/code/tensor.gsa` strictly on clean `main` (`git pull --ff-only`).
+   - Always open an isolated `git worktree` on a feature/fix branch (`git -C ~/code/tensor.gsa worktree add -b <type>/<topic> <workspace>/tensor-wt origin/main`).
+2. **Open a Pull Request & wait for CI before merging**:
+   - Push your branch (`git push -u origin <branch>`), open a PR via `gh pr create`, and merge only after both `Test (linux-x86_64)` and `Test (darwin-arm64)` succeed.
+   - Do not self-merge breaking public API changes without user review.
+
 ## Design Philosophy
 - **Pure Geisha first**: CPU kernels (`src/cpu.gsa`), Apple Metal + MPS (`src/metal.gsa`), reverse-mode AD (`src/tensor.gsa`, `src/ad.gsa`), JIT fusion (`src/jit.gsa`), optimizers (`src/optim.gsa`), and Safetensors I/O (`src/safetensors.gsa`) are written in pure Geisha without C glue.
 - **Keep `tensor.gsa` domain-agnostic**: Do not put model- or task-specific custom kernels (e.g. RWKV-7 recurrence scans) into `tensor.gsa`. Downstream projects should build custom ops on top of `customVjp` and `tensor.cuda` / `tensor.metal`.
