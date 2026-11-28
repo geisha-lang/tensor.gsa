@@ -40,6 +40,7 @@ WEAK void gs_cu_slice_f(int32_t d, const float *x, float *o, int32_t out0, int32
 WEAK void gs_cu_slice_b(int32_t d, const float *gy, float *gx, int32_t out0, int32_t id, int32_t in0, int32_t st, int32_t len) { (void)d;(void)gy;(void)gx;(void)out0;(void)id;(void)in0;(void)st;(void)len; }
 WEAK void gs_cu_sum_ax(int32_t d, const float *x, float *o, int32_t out0, int32_t dim, int32_t in0) { (void)d;(void)x;(void)o;(void)out0;(void)dim;(void)in0; }
 WEAK void gs_cu_max_ax(int32_t d, const float *x, float *o, int32_t out0, int32_t dim, int32_t in0) { (void)d;(void)x;(void)o;(void)out0;(void)dim;(void)in0; }
+WEAK void gs_cu_max_ax_b(int32_t d, const float *x, const float *gy, float *gx, int32_t out0, int32_t dim, int32_t in0) { (void)d;(void)x;(void)gy;(void)gx;(void)out0;(void)dim;(void)in0; }
 WEAK double gs_cu_sum_all(int32_t d, const float *x, int64_t n) { (void)d;(void)x;(void)n; return 0.0; }
 WEAK double gs_cu_sum_sq(int32_t d, const float *x, int64_t n) { (void)d;(void)x;(void)n; return 0.0; }
 WEAK void gs_cu_rms_f(int32_t d, const float *x, const float *w, float *o, int32_t r, int32_t dim, float eps) { (void)d;(void)x;(void)w;(void)o;(void)r;(void)dim;(void)eps; }
@@ -71,7 +72,8 @@ WEAK void *gs_cu_jit_compile(int32_t d, const char *src, const char *fn_name) { 
 WEAK void gs_cu_jit_launch_reset(void) {}
 WEAK void gs_cu_jit_launch_push_in(const void *p) { (void)p; }
 WEAK void gs_cu_jit_launch_push_sc(float v) { (void)v; }
-WEAK void gs_cu_jit_launch_run(int32_t d, void *fn, void *out_ptr, int32_t n) { (void)d;(void)fn;(void)out_ptr;(void)n; }
+WEAK int32_t gs_cu_jit_launch_run(int32_t d, void *fn, void *out_ptr, int32_t n) { (void)d;(void)fn;(void)out_ptr;(void)n; return 0; }
+WEAK void gs_cu_jit_clear_cache(void) {}
 WEAK void gs_cu_gradclip_batch_reset(void) {}
 WEAK void gs_cu_gradclip_batch_push(const float *g, float *go, int64_t n) { (void)g;(void)go;(void)n; }
 WEAK void gs_cu_gradclip_batch_run(int32_t d, float max_norm) { (void)d;(void)max_norm; }

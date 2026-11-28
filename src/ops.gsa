@@ -9,7 +9,7 @@ use tensor.cpu.{
     cpuCopyAt, cpuBinopSame, cpuScale, cpuAddScalar, cpuPowScalarFwd, cpuPowScalarBwd,
     cpuClampFwd, cpuClampBwd, cpuLeakyReluFwd, cpuLeakyReluBwd,
     cpuBcastBinop, cpuBcastReduceSum, cpuUnaryFwd, cpuUnaryBwd,
-    cpuSliceAxisFwd, cpuSliceAxisBwd, cpuSumAxis, cpuMaxAxis, cpuSumAll, cpuSumSq,
+    cpuSliceAxisFwd, cpuSliceAxisBwd, cpuSumAxis, cpuMaxAxis, cpuMaxAxisBwd, cpuSumAll, cpuSumSq,
     cpuRmsNormFwd, cpuRmsNormBwd, cpuLayerNormFwd, cpuLayerNormBwd,
     cpuL2NormLastFwd, cpuL2NormLastBwd, cpuSoftmaxFwd, cpuSoftmaxBwd,
     cpuLogSumExpFwd, cpuLogSumExpBwd, cpuCrossEntropyFwd, cpuCrossEntropyBwd,
@@ -21,7 +21,7 @@ use tensor.cuda.{
     cudaPowScalarFwd, cudaPowScalarBwd, cudaClampFwd, cudaClampBwd,
     cudaLeakyReluFwd, cudaLeakyReluBwd, cudaBcastBinop, cudaBcastReduceSum,
     cudaUnaryFwd, cudaUnaryBwd, cudaSliceAxisFwd, cudaSliceAxisBwd,
-    cudaSumAxis, cudaMaxAxis, cudaSumAll, cudaSumSq,
+    cudaSumAxis, cudaMaxAxis, cudaMaxAxisBwd, cudaSumAll, cudaSumSq,
     cudaRmsNormFwd, cudaRmsNormBwd, cudaLayerNormFwd, cudaLayerNormBwd,
     cudaL2NormLastFwd, cudaL2NormLastBwd, cudaSoftmaxFwd, cudaSoftmaxBwd,
     cudaLogSumExpFwd, cudaLogSumExpBwd, cudaCrossEntropyFwd, cudaCrossEntropyBwd,
@@ -31,9 +31,9 @@ use tensor.cuda.{
 use tensor.tensor.{
     Tensor, IntTensor, allocTensorOn, fullOn, zerosOn, cloneTensor, detach, item, axpyInPlace,
     shapeEq, dimAt, normalizeAxis, broadcastShape, broadcastStrides, packI32List, customVjp,
-    isMetal, isCuda, syncDevice,
+    isMetal, isCuda, syncDevice, checkSavedVersion,
     IrOp, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
-    JitTrace, getActiveJitTrace, jitPushScalar, jitRecordNode
+    JitTrace, getActiveJitTrace, abortActiveJitTrace, jitPushScalar, jitRecordNode
 }
 use tensor.metal.{
     metalSgemm, metalBgemm, metalBinopSame, metalScaleOrAxpy,
@@ -64,37 +64,49 @@ def unbroadcastRaw(g: Tensor, targetShape: List Int): Tensor =
 def rawBinop(op: Int, a: Tensor, b: Tensor): Tensor =
     if (shapeEq(a.shape, b.shape)) {
         let out = allocTensorOn(a.shape, a.device);
-        if (isCuda(a.device)) cudaBinopSame(devId(a.device), op, a.buf, b.buf, out.buf, a.numel)
-        else if (isMetal(a.device)) metalBinopSame(op, a.gpuBuf, b.gpuBuf, out.gpuBuf, a.numel)
-        else cpuBinopSame(op, a.buf, b.buf, out.buf, a.numel);
-        out
+        if (out.numel == 0) out
+        else {
+            if (isCuda(a.device)) cudaBinopSame(devId(a.device), op, a.buf, b.buf, out.buf, a.numel)
+            else if (isMetal(a.device)) metalBinopSame(op, a.gpuBuf, b.gpuBuf, out.gpuBuf, a.numel)
+            else cpuBinopSame(op, a.buf, b.buf, out.buf, a.numel);
+            out
+        }
     } else {
         let outSh = broadcastShape(a.shape, b.shape);
         let out = allocTensorOn(outSh, a.device);
-        let shBuf = packI32List(outSh);
-        let saBuf = packI32List(broadcastStrides(a.shape, outSh));
-        let sbBuf = packI32List(broadcastStrides(b.shape, outSh));
-        if (isCuda(a.device)) cudaBcastBinop(devId(a.device), op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
+        if (out.numel == 0) out
         else {
-            syncDevice(a.device);
-            cpuBcastBinop(op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
-        };
-        out
+            let shBuf = packI32List(outSh);
+            let saBuf = packI32List(broadcastStrides(a.shape, outSh));
+            let sbBuf = packI32List(broadcastStrides(b.shape, outSh));
+            if (isCuda(a.device)) cudaBcastBinop(devId(a.device), op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
+            else {
+                syncDevice(a.device);
+                cpuBcastBinop(op, listLen(outSh), out.numel, shBuf, saBuf, sbBuf, a.buf, b.buf, out.buf)
+            };
+            out
+        }
     }
 
 def rawScaleTensor(a: Tensor, s: Float): Tensor = {
     let out = allocTensorOn(a.shape, a.device);
-    if (isCuda(a.device)) cudaScale(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
-    else if (isMetal(a.device)) metalScaleOrAxpy("k_scale", a.gpuBuf, out.gpuBuf, floatToF32(s), a.numel)
-    else cpuScale(a.buf, floatToF32(s), out.buf, a.numel);
-    out
+    if (out.numel == 0) out
+    else {
+        if (isCuda(a.device)) cudaScale(devId(a.device), a.buf, floatToF32(s), out.buf, a.numel)
+        else if (isMetal(a.device)) metalScaleOrAxpy("k_scale", a.gpuBuf, out.gpuBuf, floatToF32(s), a.numel)
+        else cpuScale(a.buf, floatToF32(s), out.buf, a.numel);
+        out
+    }
 }
 
 def tryJitBin(op: Int, a: Tensor, b: Tensor, eager: () -> Tensor): Tensor =
     match getActiveJitTrace() {
         Some(tr) -> if (a.irId >= 0 && b.irId >= 0 && shapeEq(a.shape, b.shape))
             jitRecordNode(tr, IrBin(op, a.irId, b.irId), a.shape, a.device)
-        else eager(),
+        else if (a.irId >= 0 || b.irId >= 0) {
+            abortActiveJitTrace();
+            if (a.irId >= 0) a else b
+        } else eager(),
         None -> eager(),
     }
 
@@ -129,8 +141,12 @@ pub def sub(a: Tensor, b: Tensor): Tensor =
 pub def mul(a: Tensor, b: Tensor): Tensor =
     tryJitBin(2, a, b, () -> {
         let out = rawBinop(2, a, b);
-        let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
+        let aid = a.nodeId; let bid = b.nodeId;
+        let ad = detach(a); let bd = detach(b);
+        let aVer = cellGet(a.version); let bVer = cellGet(b.version);
         customVjp([aid, bid], out, (g: Tensor) -> {
+            checkSavedVersion(ad, aVer, "mul");
+            checkSavedVersion(bd, bVer, "mul");
             let ga = unbroadcastRaw(rawBinop(2, g, bd), ad.shape);
             let gb = unbroadcastRaw(rawBinop(2, g, ad), bd.shape);
             [(aid, ga), (bid, gb)]
@@ -140,8 +156,12 @@ pub def mul(a: Tensor, b: Tensor): Tensor =
 pub def divT(a: Tensor, b: Tensor): Tensor =
     tryJitBin(3, a, b, () -> {
         let out = rawBinop(3, a, b);
-        let aid = a.nodeId; let bid = b.nodeId; let ad = detach(a); let bd = detach(b);
+        let aid = a.nodeId; let bid = b.nodeId;
+        let ad = detach(a); let bd = detach(b);
+        let aVer = cellGet(a.version); let bVer = cellGet(b.version);
         customVjp([aid, bid], out, (g: Tensor) -> {
+            checkSavedVersion(ad, aVer, "div");
+            checkSavedVersion(bd, bVer, "div");
             let ga = unbroadcastRaw(rawBinop(3, g, bd), ad.shape);
             let b2 = rawBinop(2, bd, bd);
             let gaRaw = rawBinop(3, rawBinop(2, g, ad), b2);
@@ -237,7 +257,10 @@ def unaryOp(op: Int, x: Tensor): Tensor =
             cpuUnaryFwd(op, x.buf, out.buf, x.numel)
         };
         let xid = x.nodeId; let xd = detach(x); let yd = detach(out);
+        let xVer = cellGet(x.version); let yVer = cellGet(out.version);
         customVjp([xid], out, (g: Tensor) -> {
+            checkSavedVersion(xd, xVer, "unaryOp");
+            checkSavedVersion(yd, yVer, "unaryOp");
             let gx = allocTensorOn(xd.shape, g.device);
             if (useCuda) {
                 cudaUnaryBwd(devId(g.device), op, xd.buf, yd.buf, g.buf, gx.buf, xd.numel)
@@ -262,7 +285,19 @@ pub def round(x: Tensor): Tensor = unaryOp(8, x)
 pub def silu(x: Tensor): Tensor = unaryOp(9, x)
 pub def gelu(x: Tensor): Tensor = unaryOp(10, x)
 pub def relu(x: Tensor): Tensor = unaryOp(11, x)
-pub def softplus(x: Tensor): Tensor = log(addScalar(exp(x), 1.0))
+pub def softplus(x: Tensor): Tensor = match getActiveJitTrace() {
+    Some(_) -> add(relu(x), log(addScalar(exp(negT(abs(x))), 1.0))),
+    None -> {
+        let xd = detach(x);
+        let xVer = cellGet(x.version);
+        let out = add(relu(xd), log(addScalar(exp(negT(abs(xd))), 1.0)));
+        let xid = x.nodeId;
+        customVjp([xid], out, (g: Tensor) -> {
+            checkSavedVersion(xd, xVer, "softplus");
+            [(xid, rawBinop(2, g, sigmoid(xd)))]
+        })
+    },
+}
 
 // ============================================================================
 // Linear Algebra (Vendor BLAS SGEMM / BGEMM)
@@ -370,12 +405,16 @@ pub def bgemmNT(a: Tensor, b: Tensor): Tensor = {
 // Shape, Transpose & General Axis Ops
 // ============================================================================
 
-pub def reshape(t: Tensor, newShape: List Int): Tensor = {
-    let out = Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: newShape, numel: t.numel, device: t.device, nodeId: -1, irId: -1 };
-    let tid = t.nodeId;
-    let origShape = t.shape;
-    customVjp([tid], out, (g: Tensor) -> [(tid, Tensor { buf: g.buf, gpuBuf: g.gpuBuf, shape: origShape, numel: g.numel, device: g.device, nodeId: -1, irId: -1 })])
-}
+pub def reshape(t: Tensor, newShape: List Int): Tensor =
+    if (t.irId >= 0) {
+        abortActiveJitTrace();
+        t
+    } else {
+        let out = Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: newShape, numel: t.numel, device: t.device, nodeId: -1, irId: -1, version: t.version };
+        let tid = t.nodeId;
+        let origShape = t.shape;
+        customVjp([tid], out, (g: Tensor) -> [(tid, Tensor { buf: g.buf, gpuBuf: g.gpuBuf, shape: origShape, numel: g.numel, device: g.device, nodeId: -1, irId: -1, version: g.version })])
+    }
 
 def insertAt(xs: List Int, idx: Int, val: Int): List Int =
     if (idx <= 0) Cons(val, xs)
@@ -475,19 +514,26 @@ pub def sliceAxis(x: Tensor, axis: Int, start: Int, len: Int): Tensor = {
     })
 }
 
-pub def chunkAxis(x: Tensor, axis: Int, nChunks: Int): List Tensor = {
-    let ax = normalizeAxis(listLen(x.shape), axis);
-    let dim = dimAt(x.shape, ax);
-    let step = dim / nChunks;
-    let acc = cellNew(Nil);
-    let i = cellNew(0);
-    while (cellGet(i) < nChunks) {
-        let part = sliceAxis(x, ax, cellGet(i) * step, step);
-        cellSet(acc, Cons(part, cellGet(acc)));
-        cellSet(i, cellGet(i) + 1)
-    };
-    listRev(cellGet(acc))
-}
+pub def chunkAxis(x: Tensor, axis: Int, nChunks: Int): List Tensor =
+    if (nChunks <= 0) Nil
+    else {
+        let ax = normalizeAxis(listLen(x.shape), axis);
+        let dim = dimAt(x.shape, ax);
+        let step = (dim + nChunks - 1) / nChunks;
+        let acc = cellNew(Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < nChunks) {
+            let start = cellGet(i) * step;
+            let rem = dim - start;
+            if (rem > 0) {
+                let len = if (rem < step) rem else step;
+                let part = sliceAxis(x, ax, start, len);
+                cellSet(acc, Cons(part, cellGet(acc)))
+            } else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        listRev(cellGet(acc))
+    }
 
 pub def catAxis(xs: List Tensor, axis: Int): Tensor = match xs {
     Nil -> zerosOn([0], Cpu),
@@ -603,7 +649,7 @@ pub def sumAxis(x: Tensor, axis: Int, keepDim: Bool): Tensor = {
     let xid = x.nodeId;
     let xSh = x.shape;
     customVjp([xid], out, (g: Tensor) -> {
-        let gKeep = Tensor { buf: g.buf, gpuBuf: g.gpuBuf, shape: keepSh, numel: g.numel, device: g.device, nodeId: -1, irId: -1 };
+        let gKeep = Tensor { buf: g.buf, gpuBuf: g.gpuBuf, shape: keepSh, numel: g.numel, device: g.device, nodeId: -1, irId: -1, version: g.version };
         let z = zerosOn(xSh, g.device);
         [(xid, rawBinop(0, z, gKeep))]
     })
@@ -622,7 +668,16 @@ pub def maxAxis(x: Tensor, axis: Int, keepDim: Bool): Tensor = {
     let out = allocTensorOn(outSh, x.device);
     if (isCuda(x.device)) cudaMaxAxis(devId(x.device), x.buf, out.buf, outer, dim, inner)
     else { syncDevice(x.device); cpuMaxAxis(x.buf, out.buf, outer, dim, inner) };
-    out
+    let xid = x.nodeId;
+    let xd = detach(x);
+    let xVer = cellGet(x.version);
+    customVjp([xid], out, (g: Tensor) -> {
+        checkSavedVersion(xd, xVer, "maxAxis");
+        let gx = allocTensorOn(xd.shape, g.device);
+        if (isCuda(g.device)) cudaMaxAxisBwd(devId(g.device), xd.buf, g.buf, gx.buf, outer, dim, inner)
+        else { syncDevice(g.device); cpuMaxAxisBwd(xd.buf, g.buf, gx.buf, outer, dim, inner) };
+        [(xid, gx)]
+    })
 }
 
 pub def logSumExpLast(x: Tensor): Tensor = {

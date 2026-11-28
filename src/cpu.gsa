@@ -438,6 +438,7 @@ pub def cpuSumAxis(x: ForeignPtr, out: ForeignPtr, outer: Int, dim: Int, inner: 
 }
 
 pub def cpuMaxAxis(x: ForeignPtr, out: ForeignPtr, outer: Int, dim: Int, inner: Int): Void =
+    if (outer <= 0 || dim <= 0 || inner <= 0) () else
     withForeignPtr(x, (px) ->
         withForeignPtr(out, (po) -> {
             let o = cellNew(0);
@@ -468,6 +469,42 @@ pub def cpuMaxAxis(x: ForeignPtr, out: ForeignPtr, outer: Int, dim: Int, inner: 
             }
         })
     )
+
+pub def cpuMaxAxisBwd(x: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = {
+    cpuFill(gx, outer * dim * inner, floatToF32(0.0));
+    if (outer <= 0 || dim <= 0 || inner <= 0) () else
+    withForeignPtr(x, (px) ->
+        withForeignPtr(gy, (pgy) ->
+            withForeignPtr(gx, (pgx) -> {
+                let o = cellNew(0);
+                while (cellGet(o) < outer) {
+                    let oi = cellGet(o);
+                    let outBase = oi * inner;
+                    let k = cellNew(0);
+                    while (cellGet(k) < inner) {
+                        let ki = cellGet(k);
+                        let bestD = cellNew(0);
+                        let bestV = cellNew(scopedPtrReadF32Le(px, ((oi * dim) * inner + ki) * 4));
+                        let d = cellNew(1);
+                        while (cellGet(d) < dim) {
+                            let di = cellGet(d);
+                            let v = scopedPtrReadF32Le(px, ((oi * dim + di) * inner + ki) * 4);
+                            if (v > cellGet(bestV)) {
+                                cellSet(bestV, v);
+                                cellSet(bestD, di)
+                            } else ();
+                            cellSet(d, di + 1)
+                        };
+                        let gVal = scopedPtrReadF32Le(pgy, (outBase + ki) * 4);
+                        scopedPtrWriteF32Le(pgx, ((oi * dim + cellGet(bestD)) * inner + ki) * 4, gVal);
+                        cellSet(k, ki + 1)
+                    };
+                    cellSet(o, oi + 1)
+                }
+            })
+        )
+    )
+}
 
 pub def cpuSumAll(x: ForeignPtr, n: Int): Float =
     withForeignPtr(x, (px) -> {

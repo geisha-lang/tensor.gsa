@@ -2,11 +2,12 @@
 // with zero-keyword `Generic` deriving (`data MyModel : Params { ... }`).
 
 use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
 use std.list.{listMap, listRev}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet}
 use tensor.tensor.{
     Tensor, beginTape, endTape, stampLeaf, runBackward,
-    zerosLike, item
+    zerosLike, item, clearAdError, takeAdError
 }
 use tensor.ops.sumSqFloat
 
@@ -136,19 +137,40 @@ instance Params String {
 // Functional `valueAndGrad` & `grad`
 // ============================================================================
 
-pub def valueAndGrad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> (Float, m) = {
+pub def tryValueAndGrad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> Result (Float, m) String = {
+    clearAdError();
     let tp = beginTape();
     let tracked = mapParams((t) -> stampLeaf(tp, t), model);
-    let loss = lossFn(tracked);
-    let lossVal = item(loss);
-    let gradVec = runBackward(tp, loss);
-    endTape();
-    let grads = mapParams((t: Tensor) -> match vecGet(gradVec, t.nodeId) {
-        Some(Some(g)) -> g,
-        _ -> zerosLike(t),
-    }, tracked);
-    (lossVal, grads)
+    let loss: Tensor = lossFn(tracked);
+    if (loss.numel != 1) {
+        endTape();
+        Err("valueAndGrad requires a scalar loss (numel == 1)")
+    } else {
+        let lossVal = item(loss);
+        let gradVec = runBackward(tp, loss);
+        endTape();
+        match takeAdError() {
+            Some(errMsg) -> Err(errMsg),
+            None -> {
+                let grads = mapParams((t: Tensor) -> match vecGet(gradVec, t.nodeId) {
+                    Some(Some(g)) -> g,
+                    _ -> zerosLike(t),
+                }, tracked);
+                Ok((lossVal, grads))
+            },
+        }
+    }
 }
+
+pub def valueAndGrad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> (Float, m) =
+    match tryValueAndGrad(model, lossFn) {
+        Ok(res) -> res,
+        Err(msg) -> {
+            printLn("[tensor.ad] FATAL: " + msg);
+            sys.proc.exit(1);
+            (0.0, model)
+        },
+    }
 
 pub def grad(model, lossFn): forall m. (Params m) => (m, m -> Tensor) -> m = {
     let (_, g) = valueAndGrad(model, lossFn);
