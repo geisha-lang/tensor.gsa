@@ -9,34 +9,55 @@
 // - `checkpoint(x, fn)`: O(sqrt(L)) activation checkpointing via `customVjp`
 
 use std.option.{Option, Some, None}
-use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecSet, vecClear}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
 use std.buf.{StringBuf, bufNew, bufPushStr, bufToString}
 use std.str.intToStr
 use tensor.backend.devId
 use tensor.tensor.{
-    Tensor, IrOp, IrInput, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
+    Tensor, Tape, TapeNode, IrOp, IrInput, IrBin, IrUnary, IrScale, IrAddScalar, IrPowScalar, IrClamp, IrLeakyRelu,
     JitTrace, beginJitTrace, endJitTrace, jitStampInput,
     allocTensorOn, detach, isMetal, isCuda, syncDevice,
-    getActiveTape, setActiveTape, beginTape, stampLeaf, customVjp, runBackwardWithSeed, zerosLike
+    getActiveTape, setActiveTape, beginTape, stampLeaf, recordTapeNode, runBackwardWithSeed, zerosLike
 }
-use tensor.metal.{metalCompileCustomKernel, metalDispatchJit}
+use tensor.metal.{metalCompileCustomKernel, metalDispatchJit, metalSync, metalReleasePipeline}
 use tensor.cuda.{
     cudaJitAvailable, cudaJitCompile, cudaJitLaunchReset,
-    cudaJitLaunchPushIn, cudaJitLaunchPushSc, cudaJitLaunchRun
+    cudaJitLaunchPushIn, cudaJitLaunchPushSc, cudaJitLaunchRun, cudaJitClearCache
 }
 
 // ============================================================================
-// Pipeline Cache & Compile Stats
+// Pipeline Cache & Compile Stats (Bounded + Reclaimable)
 // ============================================================================
 
-def gJitMetalPipelines: StrMap Ptr = strMapNew()
-def gJitCudaKernels: StrMap Ptr = strMapNew()
+def gJitMetalPipelines: Cell (StrMap Ptr) = cellNew(strMapNew())
+def gJitMetalOwned: Vec Ptr = vecNew()
+def gJitCudaKernels: Cell (StrMap Ptr) = cellNew(strMapNew())
+def gJitCudaCount: Cell Int = cellNew(0)
+def gJitCacheMaxEntries: Int = 512
 def gJitCompileCount: Cell Int = cellNew(0)
 def gJitCacheHits: Cell Int = cellNew(0)
 
 pub def jitCompileCount(): Int = cellGet(gJitCompileCount)
 pub def jitCacheHits(): Int = cellGet(gJitCacheHits)
+
+pub def clearJitCaches(): Void = {
+    metalSync();
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(gJitMetalOwned)) {
+        match vecGet(gJitMetalOwned, cellGet(i)) {
+            Some(pso) -> metalReleasePipeline(pso),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    vecClear(gJitMetalOwned);
+    cellSet(gJitMetalPipelines, strMapNew());
+
+    cudaJitClearCache();
+    cellSet(gJitCudaCount, 0);
+    cellSet(gJitCudaKernels, strMapNew())
+}
 
 // ============================================================================
 // Topology Signature (Shape-Agnostic & Scalar-Value-Agnostic!)
@@ -263,10 +284,33 @@ def evalNodeCpu(op: IrOp, regs: MutArray Float32, inVals: MutArray Float32, scVa
     }
 }
 
+def evalNodesIntoOut(
+    nodesArr: MutArray IrOp, nNodes: Int, outId: Int,
+    regs: MutArray Float32, inVals: MutArray Float32, scVals: MutArray Float32,
+    po: ScopedPtr, off: Int
+): Void = {
+    let j = cellNew(0);
+    while (cellGet(j) < nNodes) {
+        let jIdx = cellGet(j);
+        arraySet(regs, jIdx, evalNodeCpu(arrayGet(nodesArr, jIdx), regs, inVals, scVals));
+        cellSet(j, jIdx + 1)
+    };
+    scopedPtrWriteF32Le(po, off, arrayGet(regs, outId))
+}
+
 def executeTraceCpu(tr: JitTrace, outId: Int, out: Tensor): Void = {
     let nNodes = vecLen(tr.nodes);
     let nIn = vecLen(tr.inputs);
     let nSc = vecLen(tr.scalars);
+    let nodesArr = arrayNew(if (nNodes > 0) nNodes else 1, IrInput(0));
+    let ni = cellNew(0);
+    while (cellGet(ni) < nNodes) {
+        match vecGet(tr.nodes, cellGet(ni)) {
+            Some(op) -> arraySet(nodesArr, cellGet(ni), op),
+            None -> (),
+        };
+        cellSet(ni, cellGet(ni) + 1)
+    };
     let regs = arrayNew(if (nNodes > 0) nNodes else 1, floatToF32(0.0));
     let inVals = arrayNew(if (nIn > 0) nIn else 1, floatToF32(0.0));
     let scVals = arrayNew(if (nSc > 0) nSc else 1, floatToF32(0.0));
@@ -278,103 +322,174 @@ def executeTraceCpu(tr: JitTrace, outId: Int, out: Tensor): Void = {
         };
         cellSet(s, cellGet(s) + 1)
     };
-    withForeignPtr(out.buf, (po) -> {
-        let i = cellNew(0);
-        while (cellGet(i) < out.numel) {
-            let off = cellGet(i) * 4;
-            let k = cellNew(0);
-            while (cellGet(k) < nIn) {
-                match vecGet(tr.inputs, cellGet(k)) {
-                    Some(tin) -> {
-                        let v = withForeignPtr(tin.buf, (pi) -> scopedPtrReadF32Le(pi, off));
-                        arraySet(inVals, cellGet(k), v)
-                    },
-                    None -> (),
-                };
-                cellSet(k, cellGet(k) + 1)
-            };
-            let j = cellNew(0);
-            while (cellGet(j) < nNodes) {
-                match vecGet(tr.nodes, cellGet(j)) {
-                    Some(op) -> arraySet(regs, cellGet(j), evalNodeCpu(op, regs, inVals, scVals)),
-                    None -> (),
-                };
-                cellSet(j, cellGet(j) + 1)
-            };
-            scopedPtrWriteF32Le(po, off, arrayGet(regs, outId));
-            cellSet(i, cellGet(i) + 1)
+    if (nIn == 1) {
+        match vecGet(tr.inputs, 0) {
+            Some(t0) -> withForeignPtr(t0.buf, (p0) ->
+                withForeignPtr(out.buf, (po) -> {
+                    let i = cellNew(0);
+                    while (cellGet(i) < out.numel) {
+                        let off = cellGet(i) * 4;
+                        arraySet(inVals, 0, scopedPtrReadF32Le(p0, off));
+                        evalNodesIntoOut(nodesArr, nNodes, outId, regs, inVals, scVals, po, off);
+                        cellSet(i, cellGet(i) + 1)
+                    }
+                })
+            ),
+            None -> (),
         }
-    })
+    } else if (nIn == 2) {
+        match (vecGet(tr.inputs, 0), vecGet(tr.inputs, 1)) {
+            (Some(t0), Some(t1)) -> withForeignPtr(t0.buf, (p0) ->
+                withForeignPtr(t1.buf, (p1) ->
+                    withForeignPtr(out.buf, (po) -> {
+                        let i = cellNew(0);
+                        while (cellGet(i) < out.numel) {
+                            let off = cellGet(i) * 4;
+                            arraySet(inVals, 0, scopedPtrReadF32Le(p0, off));
+                            arraySet(inVals, 1, scopedPtrReadF32Le(p1, off));
+                            evalNodesIntoOut(nodesArr, nNodes, outId, regs, inVals, scVals, po, off);
+                            cellSet(i, cellGet(i) + 1)
+                        }
+                    })
+                )
+            ),
+            _ -> (),
+        }
+    } else if (nIn == 3) {
+        match (vecGet(tr.inputs, 0), vecGet(tr.inputs, 1), vecGet(tr.inputs, 2)) {
+            (Some(t0), Some(t1), Some(t2)) -> withForeignPtr(t0.buf, (p0) ->
+                withForeignPtr(t1.buf, (p1) ->
+                    withForeignPtr(t2.buf, (p2) ->
+                        withForeignPtr(out.buf, (po) -> {
+                            let i = cellNew(0);
+                            while (cellGet(i) < out.numel) {
+                                let off = cellGet(i) * 4;
+                                arraySet(inVals, 0, scopedPtrReadF32Le(p0, off));
+                                arraySet(inVals, 1, scopedPtrReadF32Le(p1, off));
+                                arraySet(inVals, 2, scopedPtrReadF32Le(p2, off));
+                                evalNodesIntoOut(nodesArr, nNodes, outId, regs, inVals, scVals, po, off);
+                                cellSet(i, cellGet(i) + 1)
+                            }
+                        })
+                    )
+                )
+            ),
+            _ -> (),
+        }
+    } else {
+        withForeignPtr(out.buf, (po) -> {
+            let i = cellNew(0);
+            while (cellGet(i) < out.numel) {
+                let off = cellGet(i) * 4;
+                let k = cellNew(0);
+                while (cellGet(k) < nIn) {
+                    match vecGet(tr.inputs, cellGet(k)) {
+                        Some(tin) -> {
+                            let v = withForeignPtr(tin.buf, (pi) -> scopedPtrReadF32Le(pi, off));
+                            arraySet(inVals, cellGet(k), v)
+                        },
+                        None -> (),
+                    };
+                    cellSet(k, cellGet(k) + 1)
+                };
+                evalNodesIntoOut(nodesArr, nNodes, outId, regs, inVals, scVals, po, off);
+                cellSet(i, cellGet(i) + 1)
+            }
+        })
+    }
 }
 
-def executeTrace(tr: JitTrace, symOut: Tensor): Tensor = {
-    let out = allocTensorOn(symOut.shape, symOut.device);
+def tryExecuteTrace(tr: JitTrace, symOut: Tensor): Option Tensor = {
     if (isCuda(symOut.device)) {
         let dev = devId(symOut.device);
-        let sig = buildTraceSignature(tr, symOut.irId);
-        let kfn = match strMapGet(gJitCudaKernels, sig) {
+        let sig = intToStr(dev) + ":" + buildTraceSignature(tr, symOut.irId);
+        let kfn = match strMapGet(cellGet(gJitCudaKernels), sig) {
             Some(cached) -> {
                 cellSet(gJitCacheHits, cellGet(gJitCacheHits) + 1);
                 cached
             },
             None -> {
+                if (cellGet(gJitCudaCount) >= gJitCacheMaxEntries) clearJitCaches() else ();
                 let src = emitCudaKernel(tr, symOut.irId);
                 let compiled = cudaJitCompile(dev, src, "k_jit");
                 if (!ptrIsNull(compiled)) {
-                    strMapInsert(gJitCudaKernels, sig, compiled);
+                    strMapInsert(cellGet(gJitCudaKernels), sig, compiled);
+                    cellSet(gJitCudaCount, cellGet(gJitCudaCount) + 1);
                     cellSet(gJitCompileCount, cellGet(gJitCompileCount) + 1)
                 } else ();
                 compiled
             },
         };
-        cudaJitLaunchReset();
-        let i = cellNew(0);
-        while (cellGet(i) < vecLen(tr.inputs)) {
-            match vecGet(tr.inputs, cellGet(i)) {
-                Some(t) -> cudaJitLaunchPushIn(t.buf),
-                None -> (),
-            };
-            cellSet(i, cellGet(i) + 1)
-        };
-        let s = cellNew(0);
-        while (cellGet(s) < vecLen(tr.scalars)) {
-            match vecGet(tr.scalars, cellGet(s)) {
-                Some(v) -> cudaJitLaunchPushSc(v),
-                None -> (),
-            };
-            cellSet(s, cellGet(s) + 1)
-        };
-        cudaJitLaunchRun(dev, kfn, out.buf, out.numel);
-        out
+        if (ptrIsNull(kfn)) None
+        else {
+            let out = allocTensorOn(symOut.shape, symOut.device);
+            if (out.numel == 0) Some(out)
+            else {
+                cudaJitLaunchReset();
+                let i = cellNew(0);
+                while (cellGet(i) < vecLen(tr.inputs)) {
+                    match vecGet(tr.inputs, cellGet(i)) {
+                        Some(t) -> cudaJitLaunchPushIn(t.buf),
+                        None -> (),
+                    };
+                    cellSet(i, cellGet(i) + 1)
+                };
+                let s = cellNew(0);
+                while (cellGet(s) < vecLen(tr.scalars)) {
+                    match vecGet(tr.scalars, cellGet(s)) {
+                        Some(v) -> cudaJitLaunchPushSc(v),
+                        None -> (),
+                    };
+                    cellSet(s, cellGet(s) + 1)
+                };
+                if (cudaJitLaunchRun(dev, kfn, out.buf, out.numel)) Some(out) else None
+            }
+        }
     } else if (isMetal(symOut.device)) {
         let sig = buildTraceSignature(tr, symOut.irId);
-        let pso = match strMapGet(gJitMetalPipelines, sig) {
+        let pso = match strMapGet(cellGet(gJitMetalPipelines), sig) {
             Some(cached) -> {
                 cellSet(gJitCacheHits, cellGet(gJitCacheHits) + 1);
                 cached
             },
             None -> {
+                if (vecLen(gJitMetalOwned) >= gJitCacheMaxEntries) clearJitCaches() else ();
                 let src = emitMslKernel(tr, symOut.irId);
                 let compiled = metalCompileCustomKernel(src, "k_jit");
-                strMapInsert(gJitMetalPipelines, sig, compiled);
-                cellSet(gJitCompileCount, cellGet(gJitCompileCount) + 1);
+                if (!ptrIsNull(compiled)) {
+                    strMapInsert(cellGet(gJitMetalPipelines), sig, compiled);
+                    vecPush(gJitMetalOwned, compiled);
+                    cellSet(gJitCompileCount, cellGet(gJitCompileCount) + 1)
+                } else ();
                 compiled
             },
         };
-        let inGpus = vecNew();
-        let i = cellNew(0);
-        while (cellGet(i) < vecLen(tr.inputs)) {
-            match vecGet(tr.inputs, cellGet(i)) {
-                Some(t) -> vecPush(inGpus, t.gpuBuf),
-                None -> (),
-            };
-            cellSet(i, cellGet(i) + 1)
-        };
-        metalDispatchJit(pso, inGpus, out.gpuBuf, tr.scalars, out.numel);
-        out
+        if (ptrIsNull(pso)) None
+        else {
+            let out = allocTensorOn(symOut.shape, symOut.device);
+            if (out.numel == 0) Some(out)
+            else {
+                let inGpus = vecNew();
+                let i = cellNew(0);
+                while (cellGet(i) < vecLen(tr.inputs)) {
+                    match vecGet(tr.inputs, cellGet(i)) {
+                        Some(t) -> vecPush(inGpus, t.gpuBuf),
+                        None -> (),
+                    };
+                    cellSet(i, cellGet(i) + 1)
+                };
+                metalDispatchJit(pso, inGpus, out.gpuBuf, tr.scalars, out.numel);
+                Some(out)
+            }
+        }
     } else {
-        executeTraceCpu(tr, symOut.irId, out);
-        out
+        // Short CPU elementwise chains run faster via dedicated tight eager loops than per-node interpretation.
+        if (vecLen(tr.nodes) <= 4) None
+        else {
+            let out = allocTensorOn(symOut.shape, symOut.device);
+            executeTraceCpu(tr, symOut.irId, out);
+            Some(out)
+        }
     }
 }
 
@@ -392,7 +507,11 @@ pub def jit1(a: Tensor, f: Tensor -> Tensor): Tensor =
         let sa = jitStampInput(tr, a);
         let symOut = f(sa);
         endJitTrace();
-        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+        if (cellGet(tr.aborted) || symOut.irId < 0) f(a)
+        else match tryExecuteTrace(tr, symOut) {
+            Some(out) -> out,
+            None -> f(a),
+        }
     }
 
 pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
@@ -403,7 +522,11 @@ pub def jit2(a: Tensor, b: Tensor, f: (Tensor, Tensor) -> Tensor): Tensor =
         let sb = jitStampInput(tr, b);
         let symOut = f(sa, sb);
         endJitTrace();
-        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+        if (cellGet(tr.aborted) || symOut.irId < 0) f(a, b)
+        else match tryExecuteTrace(tr, symOut) {
+            Some(out) -> out,
+            None -> f(a, b),
+        }
     }
 
 pub def jit3(a: Tensor, b: Tensor, c: Tensor, f: (Tensor, Tensor, Tensor) -> Tensor): Tensor =
@@ -415,33 +538,58 @@ pub def jit3(a: Tensor, b: Tensor, c: Tensor, f: (Tensor, Tensor, Tensor) -> Ten
         let sc = jitStampInput(tr, c);
         let symOut = f(sa, sb, sc);
         endJitTrace();
-        if (symOut.irId < 0) symOut else executeTrace(tr, symOut)
+        if (cellGet(tr.aborted) || symOut.irId < 0) f(a, b, c)
+        else match tryExecuteTrace(tr, symOut) {
+            Some(out) -> out,
+            None -> f(a, b, c),
+        }
     }
 
 // Activation Checkpointing: discards intermediate activations during forward pass
 // and recomputes `fn` on a local tape during backward (O(sqrt(L)) memory)!
+// Correctly propagates gradients to both `x` AND any outer-tape parameters captured by `fn`.
 pub def checkpoint(x: Tensor, fn: Tensor -> Tensor): Tensor = {
     let outerTape = getActiveTape();
     match outerTape {
         None -> fn(x),
-        Some(_) -> {
+        Some(outerTp) -> {
+            let nOuter = vecLen(outerTp.nodes);
             setActiveTape(None);
             let xd = detach(x);
             let out = fn(xd);
             setActiveTape(outerTape);
             let xid = x.nodeId;
-            customVjp([xid], out, (gOut: Tensor) -> {
+            recordTapeNode(out, (gOut: Tensor) -> {
                 let prev = getActiveTape();
                 let localTp = beginTape();
+                // Reserve slots 0..nOuter-1 as passive leaves so closure-captured outer-tape
+                // parameters accumulate their gradients directly at their outer nodeId!
+                let p = cellNew(0);
+                while (cellGet(p) < nOuter) {
+                    vecPush(localTp.nodes, TapeNode { bwd: (_) -> Nil });
+                    cellSet(p, cellGet(p) + 1)
+                };
                 let xLeaf = stampLeaf(localTp, xd);
                 let recomputed = fn(xLeaf);
                 let localGrads = runBackwardWithSeed(localTp, recomputed, gOut);
                 setActiveTape(prev);
-                let gx = match vecGet(localGrads, xLeaf.nodeId) {
-                    Some(Some(g)) -> g,
-                    _ -> zerosLike(xd),
+                let contribs = cellNew(Nil);
+                if (xid >= 0) {
+                    let gx = match vecGet(localGrads, xLeaf.nodeId) {
+                        Some(Some(g)) -> g,
+                        _ -> zerosLike(xd),
+                    };
+                    cellSet(contribs, Cons((xid, gx), cellGet(contribs)))
+                } else ();
+                let oid = cellNew(0);
+                while (cellGet(oid) < nOuter) {
+                    match vecGet(localGrads, cellGet(oid)) {
+                        Some(Some(gCap)) -> cellSet(contribs, Cons((cellGet(oid), gCap), cellGet(contribs))),
+                        _ -> (),
+                    };
+                    cellSet(oid, cellGet(oid) + 1)
                 };
-                [(xid, gx)]
+                cellGet(contribs)
             })
         },
     }

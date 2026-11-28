@@ -5,6 +5,7 @@
 // 4. Mini Llama-style CausalLM training with AdamW & Muon
 // 5. Pure-Geisha Safetensors + HuggingFace `config.json` roundtrip & key parity
 
+use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listLen}
 use sys.fs.removeFile
@@ -14,15 +15,18 @@ use sys.proc.exit
 use tensor.backend.{Cpu, Metal, Cuda}
 use tensor.metal.metalAvailable
 use tensor.cuda.cudaDeviceCount
-use tensor.tensor.{Tensor, fromList, fromI32List, fromI32ListOn, randnOn, toDevice, getAt, item, shapeEq}
+use tensor.tensor.{
+    Tensor, fromList, fromI32List, fromI32ListOn, randnOn, zeros, ones, toDevice, getAt, item,
+    shapeEq, tryBroadcastShape, axpyInPlace
+}
 use tensor.ops.{
-    add, sub, mul, divT, scale, addScalar, silu, gelu, sigmoid, exp, log, square, clamp,
+    add, sub, mul, divT, scale, addScalar, silu, gelu, sigmoid, exp, log, square, clamp, softplus, reshape,
     rmsNorm, layerNorm, l2NormLast, softmax, logSumExpLast, rope, transpose2d,
     crossEntropy, crossEntropyIgnore, fusedLinearCrossEntropyChunked, mseLoss, matmul, matmulNT,
-    sliceAxis, chunkAxis, catAxis, padAxis, sumAxis, meanAxis, meanAll, l2NormFloat
+    sliceAxis, chunkAxis, catAxis, padAxis, sumAll, sumAxis, maxAxis, meanAxis, meanAll, l2NormFloat
 }
-use tensor.jit.{jit1, jit2, jitCompileCount, jitCacheHits, checkpoint}
-use tensor.ad.{Params, valueAndGrad, paramCount}
+use tensor.jit.{jit1, jit2, jitCompileCount, jitCacheHits, checkpoint, clearJitCaches}
+use tensor.ad.{Params, valueAndGrad, tryValueAndGrad, paramCount}
 use tensor.nn.{LMConfig, CausalLM, rngNew, initCausalLM, causalLMFwd}
 use tensor.optim.{
     defaultAdamW, adamwInit, adamwStep,
@@ -409,6 +413,74 @@ def testCudaGpu(): Result Void String =
         Ok(())
     }
 
+def testAstraRegressions(): Result Void String = {
+    // T1: JIT escaping via non-fused op (reshape / captured constant) returns valid concrete tensor
+    let x1 = fromList([2], [2.0, 3.0]);
+    let r1 = jit1(x1, (t) -> reshape(square(t), [2]));
+    let _ = assertTrue("T1_jit_reshape_valid", absF(getAt(r1, 0) - 4.0) < 1.0e-5 && absF(getAt(r1, 1) - 9.0) < 1.0e-5)?;
+    let c1 = fromList([2], [1.0, 1.0]);
+    let r2 = jit1(x1, (t) -> add(square(t), c1));
+    let _ = assertTrue("T1_jit_const_valid", absF(getAt(r2, 0) - 5.0) < 1.0e-5 && absF(getAt(r2, 1) - 10.0) < 1.0e-5)?;
+
+    // T2: maxAxis VJP & toDevice VJP
+    let (mVal, gMax) = valueAndGrad(fromList([2], [2.0, 3.0]), (t) -> maxAxis(t, 0, false));
+    let _ = assertTrue("T2_maxAxis_vjp", absF(mVal - 3.0) < 1.0e-5 && absF(getAt(gMax, 0)) < 1.0e-5 && absF(getAt(gMax, 1) - 1.0) < 1.0e-5)?;
+    let _ = (if (metalAvailable()) {
+        let (dVal, gDev) = valueAndGrad(fromList([2], [2.0, 3.0]), (t) -> sumAll(toDevice(t, Metal(0))));
+        assertTrue("T2_toDevice_metal_vjp", absF(dVal - 5.0) < 1.0e-5 && absF(getAt(gDev, 0) - 1.0) < 1.0e-5 && absF(getAt(gDev, 1) - 1.0) < 1.0e-5)
+    } else Ok(()))?;
+
+    // T3: checkpoint propagates gradients to closure-captured outer-tape parameters
+    let (cpVal, cpGrads) = valueAndGrad([fromList([1], [2.0]), fromList([1], [3.0])], (ps) -> match ps {
+        Cons(x, Cons(w, _)) -> checkpoint(x, (u) -> u * w),
+        _ -> zeros([1]),
+    });
+    let _ = match cpGrads {
+        Cons(gx, Cons(gw, _)) ->
+            assertTrue("T3_checkpoint_captured_param",
+                absF(cpVal - 6.0) < 1.0e-5 && absF(item(gx) - 3.0) < 1.0e-5 && absF(item(gw) - 2.0) < 1.0e-5),
+        _ -> Err("T3_checkpoint_grad_list"),
+    }?;
+
+    // T4: in-place mutation of tensor saved for backward is caught by version counter
+    let t4Res = tryValueAndGrad(fromList([1], [2.0]), (x) -> {
+        let y = x * x;
+        axpyInPlace(1.0, ones([1]), x);
+        y
+    });
+    let t4Caught = match t4Res { Err(_) -> true, Ok(_) -> false };
+    let _ = assertTrue("T4_inplace_version_caught", t4Caught)?;
+
+    // T5: strict broadcastShape (empty tensors & incompatible shapes)
+    let bEmptyOk = match tryBroadcastShape([0], [1]) { Some(sh) -> shapeEq(sh, [0]), None -> false };
+    let bIncompatOk = match tryBroadcastShape([2], [3]) { None -> true, Some(_) -> false };
+    let emptySum = add(zeros([0]), ones([1]));
+    let _ = assertTrue("T5_broadcast_empty_and_strict", bEmptyOk && bIncompatOk && shapeEq(emptySum.shape, [0]) && emptySum.numel == 0)?;
+
+    // T7: non-scalar loss rejected by tryValueAndGrad
+    let t7Res = tryValueAndGrad(fromList([2], [2.0, 3.0]), (x) -> square(x));
+    let t7Rejected = match t7Res { Err(_) -> true, Ok(_) -> false };
+    let _ = assertTrue("T7_non_scalar_loss_rejected", t7Rejected)?;
+
+    // T8: chunkAxis preserves tail elements when dim % nChunks != 0
+    let cat5 = catAxis(chunkAxis(fromList([5], [1.0, 2.0, 3.0, 4.0, 5.0]), 0, 2), 0);
+    let _ = assertTrue("T8_chunk_preserves_tail", cat5.numel == 5 && absF(getAt(cat5, 4) - 5.0) < 1.0e-5)?;
+
+    // T9: numerically stable softplus (no overflow at 100.0, exact sigmoid grad at 0.0)
+    let sp100 = softplus(fromList([1], [100.0]));
+    let (sp0, gSp0) = valueAndGrad(fromList([1], [0.0]), (x) -> softplus(x));
+    let _ = assertTrue("T9_softplus_stable",
+        absF(item(sp100) - 100.0) < 1.0e-4 && absF(sp0 - 0.6931472) < 1.0e-4 && absF(item(gSp0) - 0.5) < 1.0e-4)?;
+
+    // T10: CPU short elementwise JIT matches eager
+    let jCpu = jit1(fromList([2], [3.0, 4.0]), (t) -> addScalar(scale(t, 2.0), 1.0));
+    let _ = assertTrue("T10_cpu_short_jit", absF(getAt(jCpu, 0) - 7.0) < 1.0e-5 && absF(getAt(jCpu, 1) - 9.0) < 1.0e-5)?;
+
+    // X4: clearJitCaches runs cleanly
+    clearJitCaches();
+    Ok(())
+}
+
 def runAll(): Result Void String = {
     let _ = testBroadcasting()?;
     let _ = testUniversalOps()?;
@@ -419,6 +491,7 @@ def runAll(): Result Void String = {
     let _ = testMetalGpu()?;
     let _ = testCudaGpu()?;
     let _ = testJitAndCheckpoint()?;
+    let _ = testAstraRegressions()?;
     Ok(())
 }
 

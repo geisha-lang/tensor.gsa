@@ -198,8 +198,11 @@ data MetalCtx {
     objcReleaseFn: Ptr,
     pipelines: StrMap Ptr,
     pendingCmd: Cell (Option Ptr),
+    lastCommitted: Cell (Option Ptr),
     keepAlive: Vec ForeignPtr,
+    committedKeepAlive: Vec ForeignPtr,
     tempRelease: Vec Ptr,
+    committedTempRelease: Vec Ptr,
 }
 
 def gMetalCtx: Cell (Option MetalCtx) = cellNew(None)
@@ -231,8 +234,11 @@ def getMetalCtx(): Option MetalCtx =
                 objcReleaseFn: relFn,
                 pipelines: strMapNew(),
                 pendingCmd: cellNew(None),
+                lastCommitted: cellNew(None),
                 keepAlive: vecNew(),
+                committedKeepAlive: vecNew(),
                 tempRelease: vecNew(),
+                committedTempRelease: vecNew(),
             };
             cellSet(gMetalCtx, Some(ctx));
             c_pool_pop(pool);
@@ -244,6 +250,88 @@ pub def metalAvailable(): Bool = match getMetalCtx() {
     Some(_) -> true,
     None -> false,
 }
+
+// Expose raw MTLDevice / MTLCommandQueue so sibling libraries (e.g. kernel.gsa)
+// can share one FIFO Metal command queue without CPU sync stalls.
+pub def metalRawDevice(): Ptr = match getMetalCtx() {
+    Some(ctx) -> ctx.device,
+    None -> ptrNull(),
+}
+
+pub def metalRawQueue(): Ptr = match getMetalCtx() {
+    Some(ctx) -> ctx.queue,
+    None -> ptrNull(),
+}
+
+pub def metalAdoptQueue(dev: Ptr, queue: Ptr): Void =
+    if (ptrIsNull(dev) || ptrIsNull(queue)) ()
+    else {
+        metalSync();
+        let pool = c_pool_push();
+        let _ = msg0(dev, c_sel("retain"));
+        let _ = msg0(queue, c_sel("retain"));
+        let srcNs = nsString(mslSource());
+        let lib = msg3_ppp(dev, c_sel("newLibraryWithSource:options:error:"), srcNs, ptrNull(), ptrNull());
+        let rtldDefault = ptrOffset(ptrNull(), -2);
+        let relFn = c_dlsym(rtldDefault, "objc_release");
+        let ctx = MetalCtx {
+            device: dev,
+            queue: queue,
+            library: lib,
+            objcReleaseFn: relFn,
+            pipelines: strMapNew(),
+            pendingCmd: cellNew(None),
+            lastCommitted: cellNew(None),
+            keepAlive: vecNew(),
+            committedKeepAlive: vecNew(),
+            tempRelease: vecNew(),
+            committedTempRelease: vecNew(),
+        };
+        cellSet(gMetalProbed, true);
+        cellSet(gMetalCtx, Some(ctx));
+        c_pool_pop(pool)
+    }
+
+// Commit any pending Metal command buffer without blocking CPU (enables strict FIFO ordering
+// across libraries sharing the same MTLCommandQueue).
+pub def metalFlush(): Void = match getMetalCtx() {
+    None -> (),
+    Some(ctx) -> match cellGet(ctx.pendingCmd) {
+        None -> (),
+        Some(cb) -> {
+            let pool = c_pool_push();
+            match cellGet(ctx.lastCommitted) {
+                Some(oldCb) -> msg0_v(oldCb, c_sel("release")),
+                None -> (),
+            };
+            msg0_v(cb, c_sel("commit"));
+            cellSet(ctx.lastCommitted, Some(cb));
+            cellSet(ctx.pendingCmd, None);
+            let i = cellNew(0);
+            while (cellGet(i) < vecLen(ctx.tempRelease)) {
+                match vecGet(ctx.tempRelease, cellGet(i)) {
+                    Some(obj) -> vecPush(ctx.committedTempRelease, obj),
+                    None -> (),
+                };
+                cellSet(i, cellGet(i) + 1)
+            };
+            vecClear(ctx.tempRelease);
+            let j = cellNew(0);
+            while (cellGet(j) < vecLen(ctx.keepAlive)) {
+                match vecGet(ctx.keepAlive, cellGet(j)) {
+                    Some(fp) -> vecPush(ctx.committedKeepAlive, fp),
+                    None -> (),
+                };
+                cellSet(j, cellGet(j) + 1)
+            };
+            vecClear(ctx.keepAlive);
+            c_pool_pop(pool)
+        },
+    },
+}
+
+pub def metalReleasePipeline(pso: Ptr): Void =
+    if (ptrIsNull(pso)) () else msg0_v(pso, c_sel("release"))
 
 def getPipeline(ctx: MetalCtx, name: String): Ptr =
     match strMapGet(ctx.pipelines, name) {
@@ -272,28 +360,29 @@ def ensureCmdBuf(ctx: MetalCtx): Ptr = match cellGet(ctx.pendingCmd) {
 // Commit and wait for all pending Metal GPU operations (called automatically before CPU reads).
 pub def metalSync(): Void = match getMetalCtx() {
     None -> (),
-    Some(ctx) -> match cellGet(ctx.pendingCmd) {
-        None -> (),
-        Some(cb) -> {
-            let pool = c_pool_push();
-            msg0_v(cb, c_sel("commit"));
-            msg0_v(cb, c_sel("waitUntilCompleted"));
-            msg0_v(cb, c_sel("release"));
-            cellSet(ctx.pendingCmd, None);
-            // Release temporary MPS wrapper objects now that GPU finished
-            let i = cellNew(0);
-            let n = vecLen(ctx.tempRelease);
-            while (cellGet(i) < n) {
-                match vecGet(ctx.tempRelease, cellGet(i)) {
-                    Some(obj) -> msg0_v(obj, c_sel("release")),
-                    None -> (),
+    Some(ctx) -> {
+        metalFlush();
+        match cellGet(ctx.lastCommitted) {
+            None -> (),
+            Some(cb) -> {
+                let pool = c_pool_push();
+                msg0_v(cb, c_sel("waitUntilCompleted"));
+                msg0_v(cb, c_sel("release"));
+                cellSet(ctx.lastCommitted, None);
+                let i = cellNew(0);
+                let n = vecLen(ctx.committedTempRelease);
+                while (cellGet(i) < n) {
+                    match vecGet(ctx.committedTempRelease, cellGet(i)) {
+                        Some(obj) -> msg0_v(obj, c_sel("release")),
+                        None -> (),
+                    };
+                    cellSet(i, cellGet(i) + 1)
                 };
-                cellSet(i, cellGet(i) + 1)
-            };
-            vecClear(ctx.tempRelease);
-            vecClear(ctx.keepAlive);
-            c_pool_pop(pool)
-        },
+                vecClear(ctx.committedTempRelease);
+                vecClear(ctx.committedKeepAlive);
+                c_pool_pop(pool)
+            },
+        }
     },
 }
 

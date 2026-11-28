@@ -28,7 +28,7 @@
 #define GS_UOP_GELU    10
 #define GS_UOP_RELU    11
 
-static cublasHandle_t g_cublas = NULL;
+static cublasHandle_t g_cublas[16] = {NULL};
 static int32_t g_cuda_bf16_gemm = 0;
 static int32_t g_pool_inited[16] = {0};
 
@@ -44,12 +44,13 @@ static void ensure_mempool(int32_t dev_id) {
 }
 
 static cublasHandle_t get_cublas(int32_t dev_id) {
-    cudaSetDevice(dev_id);
-    if (!g_cublas) {
-        cublasCreate(&g_cublas);
-        cublasSetMathMode(g_cublas, CUBLAS_TF32_TENSOR_OP_MATH);
+    int32_t slot = (dev_id >= 0 && dev_id < 16) ? dev_id : 0;
+    cudaSetDevice(slot);
+    if (!g_cublas[slot]) {
+        cublasCreate(&g_cublas[slot]);
+        cublasSetMathMode(g_cublas[slot], CUBLAS_TF32_TENSOR_OP_MATH);
     }
-    return g_cublas;
+    return g_cublas[slot];
 }
 
 static inline int grid1d(int64_t n) { return (int)((n + 255) / 256); }
@@ -255,7 +256,7 @@ __global__ void k_axpy(float a, const float *x, float *y, int64_t n) {
     }
 }
 
-typedef struct { int32_t sh[8], sa[8], sb[8]; } BcastMeta;
+typedef struct { int32_t sh[16], sa[16], sb[16]; } BcastMeta;
 
 __global__ void k_bcast_binop(int32_t op, int32_t ndim, int64_t total, BcastMeta m, const float *a, const float *b, float *out) {
     int64_t idx = blockIdx.x * 256LL + threadIdx.x;
@@ -352,6 +353,18 @@ __global__ void k_max_axis(const float *x, float *o, int32_t outer, int32_t dim,
     float mx = x[((int64_t)o0 * dim) * inner + k];
     for (int32_t d = 1; d < dim; d++) { float v = x[((int64_t)o0 * dim + d) * inner + k]; if (v > mx) mx = v; }
     o[idx] = mx;
+}
+__global__ void k_max_axis_bwd(const float *x, const float *gy, float *gx, int32_t outer, int32_t dim, int32_t inner) {
+    int64_t idx = blockIdx.x * 256LL + threadIdx.x;
+    if (idx >= (int64_t)outer * inner) return;
+    int32_t o0 = (int32_t)(idx / inner), k = (int32_t)(idx % inner);
+    int32_t best_d = 0;
+    float mx = x[((int64_t)o0 * dim) * inner + k];
+    for (int32_t d = 1; d < dim; d++) {
+        float v = x[((int64_t)o0 * dim + d) * inner + k];
+        if (v > mx) { mx = v; best_d = d; }
+    }
+    gx[((int64_t)o0 * dim + best_d) * inner + k] = gy[idx];
 }
 
 // ============================================================================
@@ -772,14 +785,16 @@ void gs_cu_axpy(int32_t d, float a, const float *x, float *y, int64_t n) {
 }
 
 void gs_cu_bcast_binop(int32_t d, int32_t op, int32_t ndim, int64_t total, const int32_t *sh, const int32_t *sa, const int32_t *sb, const float *a, const float *b, float *o) {
+    if (total <= 0 || ndim <= 0 || ndim > 16) return;
     BcastMeta m = {{0}, {0}, {0}};
-    for (int32_t i = 0; i < ndim && i < 8; i++) { m.sh[i] = sh[i]; m.sa[i] = sa[i]; m.sb[i] = sb[i]; }
+    for (int32_t i = 0; i < ndim; i++) { m.sh[i] = sh[i]; m.sa[i] = sa[i]; m.sb[i] = sb[i]; }
     cudaSetDevice(d);
-    if (total > 0) k_bcast_binop<<<grid1d(total), 256>>>(op, ndim, total, m, a, b, o);
+    k_bcast_binop<<<grid1d(total), 256>>>(op, ndim, total, m, a, b, o);
 }
 void gs_cu_bcast_reduce_sum(int32_t d, int32_t ndim, int64_t src_total, int64_t dst_total, const int32_t *sh, const int32_t *sd, const float *src, float *dst) {
+    if (ndim <= 0 || ndim > 16) return;
     BcastMeta m = {{0}, {0}, {0}};
-    for (int32_t i = 0; i < ndim && i < 8; i++) { m.sh[i] = sh[i]; m.sa[i] = sd[i]; }
+    for (int32_t i = 0; i < ndim; i++) { m.sh[i] = sh[i]; m.sa[i] = sd[i]; }
     cudaSetDevice(d);
     if (dst_total > 0) cudaMemsetAsync(dst, 0, (size_t)dst_total * sizeof(float), 0);
     if (src_total > 0) k_bcast_reduce_sum<<<grid1d(src_total), 256>>>(ndim, src_total, m, src, dst);
@@ -811,7 +826,14 @@ void gs_cu_sum_ax(int32_t d, const float *x, float *o, int32_t out0, int32_t dim
 void gs_cu_max_ax(int32_t d, const float *x, float *o, int32_t out0, int32_t dim, int32_t in0) {
     cudaSetDevice(d);
     int64_t tot = (int64_t)out0 * in0;
-    if (tot > 0) k_max_axis<<<grid1d(tot), 256>>>(x, o, out0, dim, in0);
+    if (tot > 0 && dim > 0) k_max_axis<<<grid1d(tot), 256>>>(x, o, out0, dim, in0);
+}
+void gs_cu_max_ax_b(int32_t d, const float *x, const float *gy, float *gx, int32_t out0, int32_t dim, int32_t in0) {
+    cudaSetDevice(d);
+    int64_t in_tot = (int64_t)out0 * dim * in0;
+    if (in_tot > 0) cudaMemsetAsync(gx, 0, (size_t)in_tot * sizeof(float), 0);
+    int64_t tot = (int64_t)out0 * in0;
+    if (tot > 0 && dim > 0) k_max_axis_bwd<<<grid1d(tot), 256>>>(x, gy, gx, out0, dim, in0);
 }
 
 static float *g_reduce_buf = NULL;
@@ -1122,6 +1144,7 @@ typedef int (*FnNvrtcGetPtxSize)(GsNvrtcProg, size_t *);
 typedef int (*FnNvrtcGetPtx)(GsNvrtcProg, char *);
 typedef int (*FnNvrtcDestroy)(GsNvrtcProg *);
 typedef int (*FnCuModLoadData)(void **, const void *);
+typedef int (*FnCuModUnload)(void *);
 typedef int (*FnCuModGetFn)(void **, void *, const char *);
 typedef int (*FnCuLaunch)(void *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void *, void **, void **);
 
@@ -1133,8 +1156,28 @@ static FnNvrtcGetPtxSize p_nvrtcGetPtxSize = NULL;
 static FnNvrtcGetPtx p_nvrtcGetPtx = NULL;
 static FnNvrtcDestroy p_nvrtcDestroy = NULL;
 static FnCuModLoadData p_cuModLoadData = NULL;
+static FnCuModUnload p_cuModUnload = NULL;
 static FnCuModGetFn p_cuModGetFn = NULL;
 static FnCuLaunch p_cuLaunch = NULL;
+
+typedef struct { int32_t dev_id; void *mod; } JitOwnedMod;
+static JitOwnedMod *g_jit_mods = NULL;
+static int32_t g_jit_mod_count = 0;
+static int32_t g_jit_mod_cap = 0;
+
+static void track_jit_mod(int32_t dev_id, void *mod) {
+    if (!mod) return;
+    if (g_jit_mod_count >= g_jit_mod_cap) {
+        int32_t nc = g_jit_mod_cap > 0 ? g_jit_mod_cap * 2 : 64;
+        JitOwnedMod *nb = (JitOwnedMod *)realloc(g_jit_mods, (size_t)nc * sizeof(JitOwnedMod));
+        if (!nb) return;
+        g_jit_mods = nb;
+        g_jit_mod_cap = nc;
+    }
+    g_jit_mods[g_jit_mod_count].dev_id = dev_id;
+    g_jit_mods[g_jit_mod_count].mod = mod;
+    g_jit_mod_count++;
+}
 
 static int ensure_nvrtc_loaded(void) {
     if (g_jit_probed) return g_jit_ready;
@@ -1152,6 +1195,7 @@ static int ensure_nvrtc_loaded(void) {
     p_nvrtcGetPtx = (FnNvrtcGetPtx)dlsym(h_nvrtc, "nvrtcGetPTX");
     p_nvrtcDestroy = (FnNvrtcDestroy)dlsym(h_nvrtc, "nvrtcDestroyProgram");
     p_cuModLoadData = (FnCuModLoadData)dlsym(h_cuda, "cuModuleLoadData");
+    p_cuModUnload = (FnCuModUnload)dlsym(h_cuda, "cuModuleUnload");
     p_cuModGetFn = (FnCuModGetFn)dlsym(h_cuda, "cuModuleGetFunction");
     p_cuLaunch = (FnCuLaunch)dlsym(h_cuda, "cuLaunchKernel");
     if (p_nvrtcCreate && p_nvrtcCompile && p_nvrtcGetPtxSize && p_nvrtcGetPtx && p_nvrtcDestroy &&
@@ -1196,14 +1240,28 @@ void *gs_cu_jit_compile(int32_t dev_id, const char *src, const char *fn_name) {
     int rc = p_cuModLoadData(&mod, ptx);
     free(ptx);
     if (rc != 0 || !mod) return NULL;
-    if (p_cuModGetFn(&fn, mod, fn_name) != 0) return NULL;
+    if (p_cuModGetFn(&fn, mod, fn_name) != 0) {
+        if (p_cuModUnload) p_cuModUnload(mod);
+        return NULL;
+    }
+    track_jit_mod(dev_id, mod);
     return fn;
+}
+
+void gs_cu_jit_clear_cache(void) {
+    for (int32_t i = 0; i < g_jit_mod_count; i++) {
+        cudaSetDevice(g_jit_mods[i].dev_id);
+        cudaDeviceSynchronize();
+        if (p_cuModUnload && g_jit_mods[i].mod) p_cuModUnload(g_jit_mods[i].mod);
+    }
+    g_jit_mod_count = 0;
 }
 
 static const void *g_jit_ins[16];
 static int32_t g_jit_n_in = 0;
-static float g_jit_scs[64];
+static float *g_jit_scs = NULL;
 static int32_t g_jit_n_sc = 0;
+static int32_t g_jit_sc_host_cap = 0;
 static float *g_jit_sc_dev = NULL;
 static int32_t g_jit_sc_cap = 0;
 
@@ -1217,11 +1275,18 @@ void gs_cu_jit_launch_push_in(const void *ptr) {
 }
 
 void gs_cu_jit_launch_push_sc(float v) {
-    if (g_jit_n_sc < 64) g_jit_scs[g_jit_n_sc++] = v;
+    if (g_jit_n_sc >= g_jit_sc_host_cap) {
+        int32_t nc = g_jit_sc_host_cap > 0 ? g_jit_sc_host_cap * 2 : 64;
+        float *nb = (float *)realloc(g_jit_scs, (size_t)nc * sizeof(float));
+        if (!nb) return;
+        g_jit_scs = nb;
+        g_jit_sc_host_cap = nc;
+    }
+    g_jit_scs[g_jit_n_sc++] = v;
 }
 
-void gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
-    if (!fn || n <= 0 || !p_cuLaunch) return;
+int32_t gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
+    if (!fn || n <= 0 || !p_cuLaunch) return 0;
     cudaSetDevice(dev_id);
     int32_t sc_cnt = g_jit_n_sc > 0 ? g_jit_n_sc : 1;
     if (sc_cnt > g_jit_sc_cap) {
@@ -1229,12 +1294,14 @@ void gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
         if (cudaMalloc(&g_jit_sc_dev, (size_t)sc_cnt * sizeof(float)) != cudaSuccess) {
             g_jit_sc_dev = NULL;
             g_jit_sc_cap = 0;
-            return;
+            return 0;
         }
         g_jit_sc_cap = sc_cnt;
     }
     if (g_jit_n_sc > 0) {
-        cudaMemcpyAsync(g_jit_sc_dev, g_jit_scs, (size_t)g_jit_n_sc * sizeof(float), cudaMemcpyHostToDevice, 0);
+        if (cudaMemcpyAsync(g_jit_sc_dev, g_jit_scs, (size_t)g_jit_n_sc * sizeof(float), cudaMemcpyHostToDevice, 0) != cudaSuccess) {
+            return 0;
+        }
     }
     void *args[20];
     int32_t k = 0;
@@ -1242,7 +1309,8 @@ void gs_cu_jit_launch_run(int32_t dev_id, void *fn, void *out_ptr, int32_t n) {
     args[k++] = (void *)&out_ptr;
     args[k++] = (void *)&g_jit_sc_dev;
     args[k++] = (void *)&n;
-    p_cuLaunch(fn, (unsigned int)grid1d(n), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
+    int rc = p_cuLaunch(fn, (unsigned int)grid1d(n), 1, 1, 256, 1, 1, 0, NULL, args, NULL);
+    return rc == 0 ? 1 : 0;
 }
 
 // ============================================================================

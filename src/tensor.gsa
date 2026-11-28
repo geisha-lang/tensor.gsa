@@ -24,6 +24,7 @@ pub data Tensor {
     device: Device,
     nodeId: Int,
     irId: Int,
+    version: Cell Int,
 }
 
 // ============================================================================
@@ -45,12 +46,13 @@ pub data JitTrace {
     nodes: Vec IrOp,
     scalars: Vec Float32,
     inputs: Vec Tensor,
+    aborted: Cell Bool,
 }
 
 def activeJitCell: Cell (Option JitTrace) = cellNew(None)
 
 pub def beginJitTrace(): JitTrace = {
-    let tr = JitTrace { nodes: vecNew(), scalars: vecNew(), inputs: vecNew() };
+    let tr = JitTrace { nodes: vecNew(), scalars: vecNew(), inputs: vecNew(), aborted: cellNew(false) };
     cellSet(activeJitCell, Some(tr));
     tr
 }
@@ -58,6 +60,11 @@ pub def beginJitTrace(): JitTrace = {
 pub def endJitTrace(): Void = cellSet(activeJitCell, None)
 
 pub def getActiveJitTrace(): Option JitTrace = cellGet(activeJitCell)
+
+pub def abortActiveJitTrace(): Void = match cellGet(activeJitCell) {
+    Some(tr) -> cellSet(tr.aborted, true),
+    None -> (),
+}
 
 pub def jitPushScalar(tr: JitTrace, v: Float): Int = {
     let idx = vecLen(tr.scalars);
@@ -76,6 +83,7 @@ pub def jitRecordNode(tr: JitTrace, op: IrOp, sh: List Int, dev: Device): Tensor
         device: dev,
         nodeId: -1,
         irId: id,
+        version: cellNew(0),
     }
 }
 
@@ -92,6 +100,7 @@ pub def jitStampInput(tr: JitTrace, t: Tensor): Tensor = {
         device: t.device,
         nodeId: -1,
         irId: id,
+        version: t.version,
     }
 }
 
@@ -135,7 +144,7 @@ def padLeftOnes(sh: List Int, targetLen: Int): List Int = {
     cellGet(cur)
 }
 
-pub def broadcastShape(a: List Int, b: List Int): List Int = {
+pub def tryBroadcastShape(a: List Int, b: List Int): Option (List Int) = {
     let la = listLen(a);
     let lb = listLen(b);
     let nd = if (la > lb) la else lb;
@@ -144,18 +153,30 @@ pub def broadcastShape(a: List Int, b: List Int): List Int = {
     let ca = cellNew(pa);
     let cb = cellNew(pb);
     let acc = cellNew(Nil);
-    while (match (cellGet(ca), cellGet(cb)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+    let ok = cellNew(true);
+    while (cellGet(ok) && match (cellGet(ca), cellGet(cb)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
         match (cellGet(ca), cellGet(cb)) {
             (Cons(da, ra), Cons(db, rb)) -> {
-                let d = if (da > db) da else db;
-                cellSet(acc, Cons(d, cellGet(acc)));
+                if (da == db) cellSet(acc, Cons(da, cellGet(acc)))
+                else if (da == 1) cellSet(acc, Cons(db, cellGet(acc)))
+                else if (db == 1) cellSet(acc, Cons(da, cellGet(acc)))
+                else cellSet(ok, false);
                 cellSet(ca, ra);
                 cellSet(cb, rb)
             },
             _ -> (),
         }
     };
-    listRev(cellGet(acc))
+    if (cellGet(ok)) Some(listRev(cellGet(acc))) else None
+}
+
+pub def broadcastShape(a: List Int, b: List Int): List Int = match tryBroadcastShape(a, b) {
+    Some(sh) -> sh,
+    None -> {
+        printLn("[tensor] FATAL: incompatible shapes for broadcast");
+        sys.proc.exit(1);
+        Nil
+    },
 }
 
 pub def broadcastStrides(inShape: List Int, outShape: List Int): List Int = {
@@ -232,13 +253,13 @@ pub def allocTensorOn(sh: List Int, dev: Device): Tensor = {
     match dev {
         Metal(_) -> {
             let (cpuView, gpuOwner) = metalAllocShared(nb);
-            Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
+            Tensor { buf: cpuView, gpuBuf: gpuOwner, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1, version: cellNew(0) }
         },
         Cuda(id) -> {
             let cbuf = cudaAllocBuf(id, nb);
-            Tensor { buf: cbuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
+            Tensor { buf: cbuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1, version: cellNew(0) }
         },
-        _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 },
+        _ -> Tensor { buf: allocBuf(dev, nb), gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1, version: cellNew(0) },
     }
 }
 
@@ -346,14 +367,14 @@ pub def tensorFromHostBufOn(sh: List Int, hostBuf: ForeignPtr, dev: Device): Ten
         Cuda(id) -> {
             let devBuf = cudaAllocBuf(id, nb);
             cudaH2d(id, devBuf, hostBuf, nb);
-            Tensor { buf: devBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 }
+            Tensor { buf: devBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1, version: cellNew(0) }
         },
         Metal(_) -> {
             let out = allocTensorOn(sh, dev);
             cpuCopy(out.buf, hostBuf, n);
             out
         },
-        _ -> Tensor { buf: hostBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1 },
+        _ -> Tensor { buf: hostBuf, gpuBuf: None, shape: sh, numel: n, device: dev, nodeId: -1, irId: -1, version: cellNew(0) },
     }
 }
 
@@ -376,39 +397,42 @@ pub def toDevice(t: Tensor, dev: Device): Tensor =
     if (t.device == dev) t
     else {
         let nb = intToI64(t.numel) * intToI64(4);
-        match (t.device, dev) {
+        let srcDev = t.device;
+        let out = match (t.device, dev) {
             (Cuda(id1), Cuda(id2)) -> {
-                let out = allocTensorOn(t.shape, dev);
-                if (id1 == id2) cudaD2d(id1, out.buf, t.buf, nb)
+                let o = allocTensorOn(t.shape, dev);
+                if (id1 == id2) cudaD2d(id1, o.buf, t.buf, nb)
                 else {
                     let tmp = allocBuf(Cpu, nb);
                     cudaD2h(id1, tmp, t.buf, nb);
-                    cudaH2d(id2, out.buf, tmp, nb)
+                    cudaH2d(id2, o.buf, tmp, nb)
                 };
-                out
+                o
             },
             (Cuda(id), _) -> {
-                let out = allocTensorOn(t.shape, dev);
-                cudaD2h(id, out.buf, t.buf, nb);
-                out
+                let o = allocTensorOn(t.shape, dev);
+                cudaD2h(id, o.buf, t.buf, nb);
+                o
             },
             (_, Cuda(id)) -> {
                 syncDevice(t.device);
-                let out = allocTensorOn(t.shape, dev);
-                cudaH2d(id, out.buf, t.buf, nb);
-                out
+                let o = allocTensorOn(t.shape, dev);
+                cudaH2d(id, o.buf, t.buf, nb);
+                o
             },
             _ -> {
                 syncDevice(t.device);
-                let out = allocTensorOn(t.shape, dev);
-                cpuCopy(out.buf, t.buf, t.numel);
-                out
+                let o = allocTensorOn(t.shape, dev);
+                cpuCopy(o.buf, t.buf, t.numel);
+                o
             },
-        }
+        };
+        let tid = t.nodeId;
+        customVjp([tid], out, (g: Tensor) -> [(tid, toDevice(g, srcDev))])
     }
 
 pub def detach(t: Tensor): Tensor =
-    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1, irId: -1 }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: -1, irId: -1, version: t.version }
 
 pub def getAt(t: Tensor, idx: Int): Float = match t.device {
     Cuda(_) -> {
@@ -440,10 +464,13 @@ pub def toList(t: Tensor): List Float = match t.device {
     },
 }
 
-pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void = match y.device {
-    Cuda(id) -> cudaAxpy(id, floatToF32(alpha), x.buf, y.buf, y.numel),
-    Metal(_) -> metalScaleOrAxpy("k_axpy", x.gpuBuf, y.gpuBuf, floatToF32(alpha), y.numel),
-    _ -> cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel),
+pub def axpyInPlace(alpha: Float, x: Tensor, y: Tensor): Void = {
+    cellSet(y.version, cellGet(y.version) + 1);
+    match y.device {
+        Cuda(id) -> cudaAxpy(id, floatToF32(alpha), x.buf, y.buf, y.numel),
+        Metal(_) -> metalScaleOrAxpy("k_axpy", x.gpuBuf, y.gpuBuf, floatToF32(alpha), y.numel),
+        _ -> cpuAxpy(floatToF32(alpha), x.buf, y.buf, y.numel),
+    }
 }
 
 pub def cloneTensor(t: Tensor): Tensor = match t.device {
@@ -510,10 +537,30 @@ pub def endTape(): Void = cellSet(activeTapeCell, None)
 pub def getActiveTape(): Option Tape = cellGet(activeTapeCell)
 pub def setActiveTape(t: Option Tape): Void = cellSet(activeTapeCell, t)
 
+def gAdErrorCell: Cell (Option String) = cellNew(None)
+
+pub def clearAdError(): Void = cellSet(gAdErrorCell, None)
+
+pub def recordAdError(msg: String): Void = match cellGet(gAdErrorCell) {
+    None -> cellSet(gAdErrorCell, Some(msg)),
+    Some(_) -> (),
+}
+
+pub def takeAdError(): Option String = {
+    let e = cellGet(gAdErrorCell);
+    cellSet(gAdErrorCell, None);
+    e
+}
+
+pub def checkSavedVersion(t: Tensor, savedVer: Int, opName: String): Void =
+    if (cellGet(t.version) != savedVer)
+        recordAdError("in-place modification of tensor saved for backward in '" + opName + "'")
+    else ()
+
 pub def stampLeaf(tp: Tape, t: Tensor): Tensor = {
     let id = vecLen(tp.nodes);
     vecPush(tp.nodes, TapeNode { bwd: (_) -> Nil });
-    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id, irId: -1 }
+    Tensor { buf: t.buf, gpuBuf: t.gpuBuf, shape: t.shape, numel: t.numel, device: t.device, nodeId: id, irId: -1, version: t.version }
 }
 
 def anyTracked(ids: List Int): Bool = match ids {
@@ -528,7 +575,18 @@ pub def customVjp(inputIds: List Int, out: Tensor, bwdFn: Tensor -> List (Int, T
         Some(tp) -> {
             let id = vecLen(tp.nodes);
             vecPush(tp.nodes, TapeNode { bwd: bwdFn });
-            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id, irId: -1 }
+            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id, irId: -1, version: out.version }
+        },
+    }
+
+// Always register a tape node on the active tape (used by `checkpoint` which may capture outer tracked params).
+pub def recordTapeNode(out: Tensor, bwdFn: Tensor -> List (Int, Tensor)): Tensor =
+    match cellGet(activeTapeCell) {
+        None -> out,
+        Some(tp) -> {
+            let id = vecLen(tp.nodes);
+            vecPush(tp.nodes, TapeNode { bwd: bwdFn });
+            Tensor { buf: out.buf, gpuBuf: out.gpuBuf, shape: out.shape, numel: out.numel, device: out.device, nodeId: id, irId: -1, version: out.version }
         },
     }
 

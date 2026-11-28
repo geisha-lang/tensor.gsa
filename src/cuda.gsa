@@ -54,6 +54,7 @@ extern noalloc "gs_cu_slice_f" def c_cu_slice_f(dev: Int, x: ScopedPtr, o: Scope
 extern noalloc "gs_cu_slice_b" def c_cu_slice_b(dev: Int, gy: ScopedPtr, gx: ScopedPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void
 extern noalloc "gs_cu_sum_ax" def c_cu_sum_ax(dev: Int, x: ScopedPtr, o: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
 extern noalloc "gs_cu_max_ax" def c_cu_max_ax(dev: Int, x: ScopedPtr, o: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
+extern noalloc "gs_cu_max_ax_b" def c_cu_max_ax_b(dev: Int, x: ScopedPtr, gy: ScopedPtr, gx: ScopedPtr, outer: Int, dim: Int, inner: Int): Void
 extern "gs_cu_sum_all" def c_cu_sum_all(dev: Int, x: ScopedPtr, n: Int64): Float
 extern "gs_cu_sum_sq" def c_cu_sum_sq(dev: Int, x: ScopedPtr, n: Int64): Float
 
@@ -95,7 +96,8 @@ extern "gs_cu_jit_compile" def c_cu_jit_compile(dev: Int, src: String, fnName: S
 extern noalloc "gs_cu_jit_launch_reset" def c_cu_jit_launch_reset(): Void
 extern noalloc "gs_cu_jit_launch_push_in" def c_cu_jit_launch_push_in(p: ScopedPtr): Void
 extern noalloc "gs_cu_jit_launch_push_sc" def c_cu_jit_launch_push_sc(v: Float32): Void
-extern noalloc "gs_cu_jit_launch_run" def c_cu_jit_launch_run(dev: Int, fn: Ptr, out: ScopedPtr, n: Int): Void
+extern noalloc "gs_cu_jit_launch_run" def c_cu_jit_launch_run(dev: Int, fn: Ptr, out: ScopedPtr, n: Int): Int
+extern "gs_cu_jit_clear_cache" def c_cu_jit_clear_cache(): Void
 extern noalloc "gs_cu_gradclip_batch_reset" def c_cu_gradclip_batch_reset(): Void
 extern noalloc "gs_cu_gradclip_batch_push" def c_cu_gradclip_batch_push(g: ScopedPtr, go: ScopedPtr, n: Int64): Void
 extern noalloc "gs_cu_gradclip_batch_run" def c_cu_gradclip_batch_run(dev: Int, maxNorm: Float32): Void
@@ -159,6 +161,7 @@ pub def cudaSliceAxisFwd(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, inD
 pub def cudaSliceAxisBwd(dev: Int, gy: ForeignPtr, gx: ForeignPtr, outer: Int, inDim: Int, inner: Int, start: Int, len: Int): Void = c_cu_slice_b(dev, gy, gx, outer, inDim, inner, start, len)
 pub def cudaSumAxis(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = c_cu_sum_ax(dev, x, o, outer, dim, inner)
 pub def cudaMaxAxis(dev: Int, x: ForeignPtr, o: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = c_cu_max_ax(dev, x, o, outer, dim, inner)
+pub def cudaMaxAxisBwd(dev: Int, x: ForeignPtr, gy: ForeignPtr, gx: ForeignPtr, outer: Int, dim: Int, inner: Int): Void = c_cu_max_ax_b(dev, x, gy, gx, outer, dim, inner)
 pub def cudaSumAll(dev: Int, x: ForeignPtr, n: Int): Float = c_cu_sum_all(dev, x, intToI64(n))
 pub def cudaSumSq(dev: Int, x: ForeignPtr, n: Int): Float = c_cu_sum_sq(dev, x, intToI64(n))
 
@@ -209,7 +212,8 @@ pub def cudaJitCompile(dev: Int, src: String, fnName: String): Ptr = c_cu_jit_co
 pub def cudaJitLaunchReset(): Void = c_cu_jit_launch_reset()
 pub def cudaJitLaunchPushIn(p: ForeignPtr): Void = c_cu_jit_launch_push_in(p)
 pub def cudaJitLaunchPushSc(v: Float32): Void = c_cu_jit_launch_push_sc(v)
-pub def cudaJitLaunchRun(dev: Int, fn: Ptr, out: ForeignPtr, n: Int): Void = c_cu_jit_launch_run(dev, fn, out, n)
+pub def cudaJitLaunchRun(dev: Int, fn: Ptr, out: ForeignPtr, n: Int): Bool = c_cu_jit_launch_run(dev, fn, out, n) != 0
+pub def cudaJitClearCache(): Void = c_cu_jit_clear_cache()
 
 pub def cudaGradClipBatchReset(): Void = c_cu_gradclip_batch_reset()
 pub def cudaGradClipBatchPush(g: ForeignPtr, go: ForeignPtr, n: Int): Void = c_cu_gradclip_batch_push(g, go, intToI64(n))
